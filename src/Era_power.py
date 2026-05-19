@@ -13,6 +13,7 @@ Run on the SAME machine as ERA Port.
 import time
 import re
 import logging
+import subprocess
 import win32gui
 import win32con
 import win32api
@@ -23,8 +24,8 @@ from pywinauto.keyboard import send_keys
 # ─────────────────────────────────────────────
 #  CONFIGURATION  (hardcode your credentials here)
 # ─────────────────────────────────────────────
-ERA_USERNAME       = "partscounter"       # e.g. "PARTSCOUNTER"
-ERA_PASSWORD       = "ap15cu6"       # your eraPower password
+ERA_USERNAME       = "YOUR_USERNAME"       # e.g. "PARTSCOUNTER"
+ERA_PASSWORD       = "YOUR_PASSWORD"       # your eraPower password
 ERA_WORKSTATION_ID = "429"                 # workstation ID shown in title bar
 
 # Menu selection codes
@@ -81,6 +82,7 @@ def find_era_window():
     for win in windows:
         try:
             title = win.window_text()
+            # Match regardless of Open/Closed state in title
             if "ERA Port" in title and "172.16.2.1 Windows Sockets" in title:
                 log.info(f"Found ERA Port window: {title}")
                 app = Application(backend="uia").connect(handle=win.handle)
@@ -103,13 +105,30 @@ def type_and_enter(window, text, wait=WAIT_MEDIUM):
 
 
 def read_screen_text(window):
+    """
+    Reads text from ERA Port terminal using Edit menu Select All + Copy.
+    ERA Port intercepts Ctrl+A/C as terminal input, so we use the menu instead.
+    """
     try:
         window.set_focus()
         time.sleep(0.3)
-        send_keys("^a")
-        time.sleep(0.3)
-        send_keys("^c")
-        time.sleep(0.5)
+
+        # Use Edit menu -> Select All, then Edit -> Copy
+        # This avoids sending Ctrl+A/C which ERA Port intercepts as text
+        try:
+            edit_menu = window.menu_select("Edit->Select All")
+            time.sleep(0.3)
+            window.menu_select("Edit->Copy")
+            time.sleep(0.5)
+        except Exception:
+            # Fallback: try pywinauto menu
+            try:
+                window.menu_select("Edit->Copy all")
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+        # Read clipboard
         win32clipboard.OpenClipboard()
         try:
             text = win32clipboard.GetClipboardData(win32con.CF_TEXT)
@@ -119,7 +138,10 @@ def read_screen_text(window):
             text = ""
         finally:
             win32clipboard.CloseClipboard()
+
+        log.debug(f"Screen text read: {repr(text[:200])}")
         return text
+
     except Exception as e:
         log.warning(f"Could not read screen text: {e}")
         return ""
@@ -147,44 +169,46 @@ def wait_for_text(window, expected_text, timeout=10, interval=0.5):
 
 def login(window):
     """
-    Handles the full login sequence:
-      1. Enter username
-      2. Enter password
-      3. Enter workstation ID
-      4. Dismiss any notification screen (press Enter)
-    Returns True on success.
+    Handles the full login sequence using blind typing.
+    We know the exact sequence of prompts so we don't need to read the screen.
+
+    Sequence:
+      1. h558 login:          -> type username + Enter
+      2. Password:            -> type password + Enter
+      3. Workstation ID:      -> type 429 + Enter
+      4. Notification screen  -> press Enter to dismiss (if present)
+      5. Main menu            -> ready
     """
-    log.info("Starting login sequence...")
+    log.info("Starting login sequence (blind typing mode)...")
 
-    # Step 1: Wait for login prompt and enter username
-    if not wait_for_text(window, "login:"):
-        raise RuntimeError("Login prompt not found on screen.")
+    window.set_focus()
+    time.sleep(WAIT_MEDIUM)
+
+    # Step 1: Type username
     log.info("Entering username...")
-    type_and_enter(window, ERA_USERNAME, wait=WAIT_MEDIUM)
+    send_keys(ERA_USERNAME, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_MEDIUM)
 
-    # Step 2: Enter password
-    # NOTE: Password prompt may say 'Password:' or similar
+    # Step 2: Type password
     log.info("Entering password...")
-    type_and_enter(window, ERA_PASSWORD, wait=WAIT_MEDIUM)
+    send_keys(ERA_PASSWORD, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_MEDIUM)
 
-    # Step 3: Enter workstation ID
-    if not wait_for_text(window, "Enter your work station ID"):
-        raise RuntimeError("Workstation ID prompt not found.")
+    # Step 3: Type workstation ID
     log.info(f"Entering workstation ID: {ERA_WORKSTATION_ID}")
-    type_and_enter(window, ERA_WORKSTATION_ID, wait=WAIT_LONG)
+    send_keys(ERA_WORKSTATION_ID, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_LONG)
 
-    # Step 4: Dismiss any notification/announcement screen
-    # (e.g. Mercedes-Benz Superservice Menus overdue notice)
-    screen = read_screen_text(window)
-    if "The following files have been sent" in screen or "Overdue" in screen:
-        log.info("Dismissing notification screen...")
-        type_and_enter(window, "", wait=WAIT_MEDIUM)  # just press Enter
+    # Step 4: Dismiss notification screen if present
+    # Safe to always press Enter here — if no notification it goes to main menu anyway
+    log.info("Dismissing notification screen (if any)...")
+    send_keys("{ENTER}")
+    time.sleep(WAIT_LONG)
 
-    # Step 5: Confirm we're at the main menu
-    if not wait_for_text(window, "Selection:"):
-        raise RuntimeError("Main menu not reached after login.")
-
-    log.info("Login successful. Main menu reached.")
+    log.info("Login sequence complete. Should be at main menu now.")
     return True
 
 
@@ -198,7 +222,11 @@ def navigate_to(window, menu_code):
     Use this to navigate to any screen (2021, 2525, 2140, etc.)
     """
     log.info(f"Navigating to menu: {menu_code}")
-    type_and_enter(window, menu_code, wait=WAIT_LONG)
+    window.set_focus()
+    time.sleep(WAIT_SHORT)
+    send_keys(menu_code, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_LONG)
 
 
 def go_to_main_menu(window):
