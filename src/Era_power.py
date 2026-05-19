@@ -13,14 +13,18 @@ Run on the SAME machine as ERA Port.
 import time
 import re
 import logging
+import win32gui
+import win32con
+import win32api
+import win32clipboard
 from pywinauto import Application, Desktop
 from pywinauto.keyboard import send_keys
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION  (hardcode your credentials here)
 # ─────────────────────────────────────────────
-ERA_USERNAME       = "YOUR_USERNAME"       # e.g. "PARTSCOUNTER"
-ERA_PASSWORD       = "YOUR_PASSWORD"       # your eraPower password
+ERA_USERNAME       = "partscounter"       # e.g. "PARTSCOUNTER"
+ERA_PASSWORD       = "ap15cu6"       # your eraPower password
 ERA_WORKSTATION_ID = "429"                 # workstation ID shown in title bar
 
 # Menu selection codes
@@ -77,7 +81,7 @@ def find_era_window():
     for win in windows:
         try:
             title = win.window_text()
-            if "ERA Port" in title and "172.16.2.1 Windows Sockets Open" in title:
+            if "ERA Port" in title and "172.16.2.1 Windows Sockets" in title:
                 log.info(f"Found ERA Port window: {title}")
                 app = Application(backend="uia").connect(handle=win.handle)
                 return app.window(handle=win.handle)
@@ -99,21 +103,23 @@ def type_and_enter(window, text, wait=WAIT_MEDIUM):
 
 
 def read_screen_text(window):
-    """
-    Reads all visible text from the ERA Port terminal window.
-    Returns a single string with all screen content.
-    """
     try:
-        # ERA Port is a terminal emulator — grab text from the main edit control
-        texts = []
-        for ctrl in window.descendants():
-            try:
-                t = ctrl.window_text()
-                if t.strip():
-                    texts.append(t)
-            except Exception:
-                continue
-        return "\n".join(texts)
+        window.set_focus()
+        time.sleep(0.3)
+        send_keys("^a")
+        time.sleep(0.3)
+        send_keys("^c")
+        time.sleep(0.5)
+        win32clipboard.OpenClipboard()
+        try:
+            text = win32clipboard.GetClipboardData(win32con.CF_TEXT)
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+        finally:
+            win32clipboard.CloseClipboard()
+        return text
     except Exception as e:
         log.warning(f"Could not read screen text: {e}")
         return ""
