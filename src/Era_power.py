@@ -13,8 +13,6 @@
 # import time
 # import re
 # import logging
-# import subprocess
-# import win32gui
 # import win32con
 # import win32api
 # import win32clipboard
@@ -24,8 +22,8 @@
 # # ─────────────────────────────────────────────
 # #  CONFIGURATION  (hardcode your credentials here)
 # # ─────────────────────────────────────────────
-# ERA_USERNAME       = "YOUR_USERNAME"       # e.g. "PARTSCOUNTER"
-# ERA_PASSWORD       = "YOUR_PASSWORD"       # your eraPower password
+# ERA_USERNAME       = "partscounter"       # e.g. "PARTSCOUNTER"
+# ERA_PASSWORD       = "ap15cu6"       # your eraPower password
 # ERA_WORKSTATION_ID = "429"                 # workstation ID shown in title bar
 
 # # Menu selection codes
@@ -106,29 +104,35 @@
 
 # def read_screen_text(window):
 #     """
-#     Reads text from ERA Port terminal using Edit menu Select All + Copy.
-#     ERA Port intercepts Ctrl+A/C as terminal input, so we use the menu instead.
+#     Reads visible screen text from ERA Port terminal using:
+#       Alt+E → W (Select Window) → Alt+E → C (Copy) → clipboard
+#     'Select Window' copies only visible screen, not the entire scroll buffer.
+#     Confirmed working on ERA Port terminal emulator.
 #     """
 #     try:
-#         window.set_focus()
-#         time.sleep(0.3)
+#         import pyautogui
+#         pyautogui.FAILSAFE = False
 
-#         # Use Edit menu -> Select All, then Edit -> Copy
-#         # This avoids sending Ctrl+A/C which ERA Port intercepts as text
-#         try:
-#             edit_menu = window.menu_select("Edit->Select All")
-#             time.sleep(0.3)
-#             window.menu_select("Edit->Copy")
-#             time.sleep(0.5)
-#         except Exception:
-#             # Fallback: try pywinauto menu
-#             try:
-#                 window.menu_select("Edit->Copy all")
-#                 time.sleep(0.5)
-#             except Exception:
-#                 pass
+#         # Click center of ERA Port to ensure it has focus
+#         rect = window.rectangle()
+#         center_x = (rect.left + rect.right) // 2
+#         center_y = (rect.top + rect.bottom) // 2
+#         pyautogui.click(center_x, center_y)
+#         time.sleep(0.8)
 
-#         # Read clipboard
+#         # Alt+E → W = Select Window (visible screen only, not scroll buffer)
+#         pyautogui.hotkey('alt', 'e')
+#         time.sleep(0.6)
+#         pyautogui.press('w')
+#         time.sleep(0.4)
+
+#         # Alt+E → C = Copy
+#         pyautogui.hotkey('alt', 'e')
+#         time.sleep(0.6)
+#         pyautogui.press('c')
+#         time.sleep(0.5)
+
+#         # Read from clipboard
 #         win32clipboard.OpenClipboard()
 #         try:
 #             text = win32clipboard.GetClipboardData(win32con.CF_TEXT)
@@ -139,9 +143,12 @@
 #         finally:
 #             win32clipboard.CloseClipboard()
 
-#         log.debug(f"Screen text read: {repr(text[:200])}")
+#         log.debug(f"Screen text captured ({len(text)} chars)")
 #         return text
 
+#     except ImportError:
+#         log.error("pyautogui not installed. Run: py -3.14 -m pip install pyautogui")
+#         return ""
 #     except Exception as e:
 #         log.warning(f"Could not read screen text: {e}")
 #         return ""
@@ -261,24 +268,31 @@
 #     """
 #     log.info(f"Looking up part: {make_code} / {part_number}")
 
-#     # Navigate to parts inquiry
+#     # Navigate to parts inquiry and wait for screen to fully load
 #     navigate_to(window, MENU_PARTS_INQUIRY)
-
-#     # Wait for parts inquiry screen
-#     if not wait_for_text(window, "Parts Counter"):
-#         raise RuntimeError("Parts Inquiry screen did not load.")
+#     time.sleep(WAIT_LONG)  # wait for Parts Counter screen to appear
 
 #     # Enter Make code
 #     log.info(f"Entering make code: {make_code}")
-#     type_and_enter(window, make_code, wait=WAIT_MEDIUM)
+#     window.set_focus()
+#     send_keys(make_code, pause=0.05)
+#     send_keys("{ENTER}")
+#     time.sleep(WAIT_MEDIUM)
 
 #     # Enter Part number
 #     log.info(f"Entering part number: {part_number}")
-#     type_and_enter(window, part_number, wait=WAIT_LONG)
+#     window.set_focus()
+#     send_keys(part_number, pause=0.05)
+#     send_keys("{ENTER}")
+#     time.sleep(WAIT_LONG)  # wait for results to load
 
-#     # Read the result screen
+#     # Now read the screen ONCE — no polling loop
 #     screen = read_screen_text(window)
-#     log.debug(f"Parts screen content:\n{screen}")
+
+#     # DEBUG: print raw screen
+#     print("=== RAW SCREEN TEXT ===")
+#     print(repr(screen[:800]))
+#     print("=======================")
 
 #     # Parse the pricing from screen
 #     result = parse_parts_result(screen, part_number)
@@ -379,9 +393,7 @@
 #     log.info(f"Creating new quote for: {customer_name}")
 
 #     navigate_to(window, MENU_QUOTE)
-
-#     if not wait_for_text(window, "QUOTES"):
-#         raise RuntimeError("Quote screen did not load.")
+#     time.sleep(WAIT_LONG)
 
 #     # Press 'A' to Add a new quote
 #     window.set_focus()
@@ -421,9 +433,7 @@
 #     log.info(f"Modifying quote #{quote_number} with new prices...")
 
 #     navigate_to(window, MENU_QUOTE)
-
-#     if not wait_for_text(window, "QUOTES"):
-#         raise RuntimeError("Quote screen did not load.")
+#     time.sleep(WAIT_LONG)
 
 #     # Enter existing quote number to load it
 #     type_and_enter(window, quote_number, wait=WAIT_MEDIUM)
@@ -603,24 +613,24 @@
 #     except Exception as e:
 #         log.error(f"Error: {e}")
 #         raise
-## working code ( but cuasing issues while trying to read the sceen text ) 
+# 
 """
 eraPower Automation Module
 ==========================
 Controls the ERA Port terminal window using pywinauto.
 Handles login, navigation, parts inquiry, and quoting.
+Auto-launches ERA Port if not already running.
 
 Requirements:
-    pip install pywinauto pywin32
-
-Run on the SAME machine as ERA Port.
+    py -3.14 -m pip install pywinauto pywin32 pyautogui pillow
 """
 
 import time
 import re
 import logging
 import subprocess
-import win32gui
+import os
+import json
 import win32con
 import win32api
 import win32clipboard
@@ -628,25 +638,32 @@ from pywinauto import Application, Desktop
 from pywinauto.keyboard import send_keys
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  (hardcode your credentials here)
+#  CONFIGURATION
 # ─────────────────────────────────────────────
-ERA_USERNAME       = "YOUR_USERNAME"       # e.g. "PARTSCOUNTER"
-ERA_PASSWORD       = "YOUR_PASSWORD"       # your eraPower password
-ERA_WORKSTATION_ID = "429"                 # workstation ID shown in title bar
+ERA_USERNAME       = "partscounter"
+ERA_PASSWORD       = "ap15cu6"
+ERA_WORKSTATION_ID = "429"
+
+# TODO: Update this path to the actual ERA Port executable on this machine
+# Common locations:
+#   C:\Program Files\Ericom Software\PowerTerm\ptw32.exe
+#   C:\Program Files (x86)\ERA Port\eraport.exe
+#   C:\ERALink\ERALink1.wic  (session file — double-click to open)
+ERA_PORT_EXE  = r"C:\Program Files (x86)\ERALink Plus\wInteg.exe"
+ERA_PORT_WAIT = 5  # seconds to wait for ERA Port to launch
 
 # Menu selection codes
 MENU_PARTS_INQUIRY = "2021"
 MENU_QUOTE         = "2525"
 MENU_SUPPLIER      = "2140"
 
-# How long to wait (seconds) between keystrokes / screen loads
-# Increase these if the system is slow to respond
+# Timing — increase if system is slow
 WAIT_SHORT  = 0.5
 WAIT_MEDIUM = 1.0
 WAIT_LONG   = 2.0
 
 # ─────────────────────────────────────────────
-#  MAKE CODES  (add more as needed)
+#  MAKE CODES
 # ─────────────────────────────────────────────
 MAKE_CODES = {
     "toyota":         "TO",
@@ -712,36 +729,33 @@ def type_and_enter(window, text, wait=WAIT_MEDIUM):
 
 def read_screen_text(window):
     """
-    Reads text from ERA Port terminal using Edit menu -> Copy All Back Pages.
-    ERA Port intercepts Ctrl+A/C as terminal input so we use the menu.
+    Reads visible screen text from ERA Port terminal using:
+      Alt+E → W (Select Window) → Alt+E → C (Copy) → clipboard
+    'Select Window' copies only visible screen, not the entire scroll buffer.
+    Confirmed working on ERA Port terminal emulator.
     """
     try:
-        window.set_focus()
+        import pyautogui
+        pyautogui.FAILSAFE = False
+
+        # Click center of ERA Port to ensure it has focus
+        rect = window.rectangle()
+        center_x = (rect.left + rect.right) // 2
+        center_y = (rect.top + rect.bottom) // 2
+        pyautogui.click(center_x, center_y)
+        time.sleep(0.8)
+
+        # Alt+E → W = Select Window (visible screen only, not scroll buffer)
+        pyautogui.hotkey('alt', 'e')
+        time.sleep(0.6)
+        pyautogui.press('w')
+        time.sleep(0.4)
+
+        # Alt+E → C = Copy
+        pyautogui.hotkey('alt', 'e')
+        time.sleep(0.6)
+        pyautogui.press('c')
         time.sleep(0.5)
-
-        # Try Edit menu options — ERA Port has "Copy All Back Pages" or similar
-        copied = False
-        for menu_path in [
-            "Edit->Select All",
-            "Edit->Copy All Back Pages",
-            "Edit->Copy",
-        ]:
-            try:
-                window.menu_select(menu_path)
-                time.sleep(0.5)
-                # If Select All, follow with Copy
-                if "Select" in menu_path:
-                    window.menu_select("Edit->Copy")
-                    time.sleep(0.5)
-                copied = True
-                log.debug(f"Used menu: {menu_path}")
-                break
-            except Exception:
-                continue
-
-        if not copied:
-            log.warning("Could not access Edit menu to copy screen text.")
-            return ""
 
         # Read from clipboard
         win32clipboard.OpenClipboard()
@@ -754,8 +768,12 @@ def read_screen_text(window):
         finally:
             win32clipboard.CloseClipboard()
 
+        log.debug(f"Screen text captured ({len(text)} chars)")
         return text
 
+    except ImportError:
+        log.error("pyautogui not installed. Run: py -3.14 -m pip install pyautogui")
+        return ""
     except Exception as e:
         log.warning(f"Could not read screen text: {e}")
         return ""
@@ -843,16 +861,48 @@ def navigate_to(window, menu_code):
     time.sleep(WAIT_LONG)
 
 
+def launch_era_port():
+    """
+    Launches ERA Port if it's not already running.
+    Waits for the login screen to appear before returning.
+    Returns the ERA Port window.
+    """
+    # Check if already running
+    try:
+        window = find_era_window()
+        log.info("ERA Port already running — reusing existing window.")
+        return window
+    except RuntimeError:
+        pass
+
+    log.info(f"Launching ERA Port from: {ERA_PORT_EXE}")
+    if not os.path.exists(ERA_PORT_EXE):
+        raise FileNotFoundError(
+            f"ERA Port executable not found at: {ERA_PORT_EXE}\n"
+            f"Update ERA_PORT_EXE in the config section at the top of this file."
+        )
+
+    subprocess.Popen([ERA_PORT_EXE], shell=True)
+    log.info(f"Waiting {ERA_PORT_WAIT}s for ERA Port to start...")
+    time.sleep(ERA_PORT_WAIT)
+
+    # Find the window after launch
+    window = find_era_window()
+    log.info("ERA Port launched successfully.")
+    return window
+
+
 def go_to_main_menu(window):
     """
-    Returns to the main menu from anywhere by pressing F9 or Escape.
-    # TODO: Confirm the correct key to return to main menu in your eraPower setup
+    Returns to the main menu from any screen.
+    Sends ESC multiple times then navigates to main menu selection.
     """
     log.info("Returning to main menu...")
     window.set_focus()
-    send_keys("{ESC}")
-    time.sleep(WAIT_SHORT)
-    send_keys("{ESC}")
+    # Send ESC 3 times to back out of any sub-menu
+    for _ in range(3):
+        send_keys("{ESC}")
+        time.sleep(WAIT_SHORT)
     time.sleep(WAIT_MEDIUM)
 
 
@@ -875,27 +925,30 @@ def lookup_part(window, make_code, part_number):
     """
     log.info(f"Looking up part: {make_code} / {part_number}")
 
-    # Navigate to parts inquiry
+    # Navigate to parts inquiry and wait for screen to fully load
     navigate_to(window, MENU_PARTS_INQUIRY)
-
-    # Wait for parts inquiry screen
-    if not wait_for_text(window, "Parts Counter"):
-        raise RuntimeError("Parts Inquiry screen did not load.")
+    time.sleep(WAIT_LONG)  # wait for Parts Counter screen to appear
 
     # Enter Make code
     log.info(f"Entering make code: {make_code}")
-    type_and_enter(window, make_code, wait=WAIT_MEDIUM)
+    window.set_focus()
+    send_keys(make_code, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_MEDIUM)
 
     # Enter Part number
     log.info(f"Entering part number: {part_number}")
-    type_and_enter(window, part_number, wait=WAIT_LONG)
+    window.set_focus()
+    send_keys(part_number, pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_LONG)  # wait for results to load
 
-    # Read the result screen
+    # Now read the screen ONCE — no polling loop
     screen = read_screen_text(window)
 
-    # DEBUG: print raw screen so we can see what's being captured
+    # DEBUG: print raw screen
     print("=== RAW SCREEN TEXT ===")
-    print(repr(screen[:500]))
+    print(repr(screen[:800]))
     print("=======================")
 
     # Parse the pricing from screen
@@ -997,9 +1050,7 @@ def create_quote(window, customer_name, make_code, parts):
     log.info(f"Creating new quote for: {customer_name}")
 
     navigate_to(window, MENU_QUOTE)
-
-    if not wait_for_text(window, "QUOTES"):
-        raise RuntimeError("Quote screen did not load.")
+    time.sleep(WAIT_LONG)
 
     # Press 'A' to Add a new quote
     window.set_focus()
@@ -1039,9 +1090,7 @@ def modify_quote(window, quote_number, parts):
     log.info(f"Modifying quote #{quote_number} with new prices...")
 
     navigate_to(window, MENU_QUOTE)
-
-    if not wait_for_text(window, "QUOTES"):
-        raise RuntimeError("Quote screen did not load.")
+    time.sleep(WAIT_LONG)
 
     # Enter existing quote number to load it
     type_and_enter(window, quote_number, wait=WAIT_MEDIUM)
@@ -1194,18 +1243,22 @@ def get_requote_price(part_info, competitor_prices):
 
 if __name__ == "__main__":
     """
-    Quick test: logs into eraPower and looks up one part.
-    Run this on the same machine as ERA Port to verify automation works.
+    Test script: auto-launches ERA Port, logs in, looks up a part,
+    saves result to JSON, then returns to main menu.
     """
-    try:
-        # Find and attach to ERA Port window
-        era_window = find_era_window()
+    # Output file for part lookup results
+    # This JSON file is how eraPower results are shared with other modules (e.g. PartsCheck bot)
+    OUTPUT_FILE = r"C:\Projects\pentana\era_results.json"
 
-        # Login
+    try:
+        # Step 1: Launch ERA Port (or reuse if already open)
+        era_window = launch_era_port()
+
+        # Step 2: Login
         login(era_window)
 
-        # Test: look up a known part
-        # TODO: Replace with a real part number from your system
+        # Step 3: Look up a test part
+        # TODO: Replace with dynamic part numbers from PartsCheck orders
         result = lookup_part(era_window, "TO", "2321721010")
 
         if result:
@@ -1215,9 +1268,21 @@ if __name__ == "__main__":
             print(f"   Available:   {result['avail']}")
             print(f"   Sale Price:  ${result['sale_price']}")
             print(f"   List Price:  ${result['list_price']}")
+
+            # Save result to JSON for use by other modules
+            with open(OUTPUT_FILE, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"\n💾 Result saved to: {OUTPUT_FILE}")
+
         else:
             print("❌ Part not found.")
 
+        # Step 4: Return to main menu ready for next task
+        go_to_main_menu(era_window)
+        log.info("Returned to main menu. Ready for next task.")
+
+    except FileNotFoundError as e:
+        log.error(str(e))
     except Exception as e:
         log.error(f"Error: {e}")
         raise
