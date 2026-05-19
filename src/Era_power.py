@@ -3,16 +3,18 @@
 # ==========================
 # Controls the ERA Port terminal window using pywinauto.
 # Handles login, navigation, parts inquiry, and quoting.
+# Auto-launches ERA Port if not already running.
 
 # Requirements:
-#     pip install pywinauto pywin32
-
-# Run on the SAME machine as ERA Port.
+#     py -3.14 -m pip install pywinauto pywin32 pyautogui pillow
 # """
 
 # import time
 # import re
 # import logging
+# import subprocess
+# import os
+# import json
 # import win32con
 # import win32api
 # import win32clipboard
@@ -20,25 +22,32 @@
 # from pywinauto.keyboard import send_keys
 
 # # ─────────────────────────────────────────────
-# #  CONFIGURATION  (hardcode your credentials here)
+# #  CONFIGURATION
 # # ─────────────────────────────────────────────
-# ERA_USERNAME       = "partscounter"       # e.g. "PARTSCOUNTER"
-# ERA_PASSWORD       = "ap15cu6"       # your eraPower password
-# ERA_WORKSTATION_ID = "429"                 # workstation ID shown in title bar
+# ERA_USERNAME       = "partscounter"
+# ERA_PASSWORD       = "ap15cu6"
+# ERA_WORKSTATION_ID = "429"
+
+# # TODO: Update this path to the actual ERA Port executable on this machine
+# # Common locations:
+# #   C:\Program Files\Ericom Software\PowerTerm\ptw32.exe
+# #   C:\Program Files (x86)\ERA Port\eraport.exe
+# #   C:\ERALink\ERALink1.wic  (session file — double-click to open)
+# ERA_PORT_EXE  = r"C:\Program Files (x86)\ERALink Plus\wInteg.exe"
+# ERA_PORT_WAIT = 5  # seconds to wait for ERA Port to launch
 
 # # Menu selection codes
 # MENU_PARTS_INQUIRY = "2021"
 # MENU_QUOTE         = "2525"
 # MENU_SUPPLIER      = "2140"
 
-# # How long to wait (seconds) between keystrokes / screen loads
-# # Increase these if the system is slow to respond
+# # Timing — increase if system is slow
 # WAIT_SHORT  = 0.5
 # WAIT_MEDIUM = 1.0
 # WAIT_LONG   = 2.0
 
 # # ─────────────────────────────────────────────
-# #  MAKE CODES  (add more as needed)
+# #  MAKE CODES
 # # ─────────────────────────────────────────────
 # MAKE_CODES = {
 #     "toyota":         "TO",
@@ -236,16 +245,48 @@
 #     time.sleep(WAIT_LONG)
 
 
+# def launch_era_port():
+#     """
+#     Launches ERA Port if it's not already running.
+#     Waits for the login screen to appear before returning.
+#     Returns the ERA Port window.
+#     """
+#     # Check if already running
+#     try:
+#         window = find_era_window()
+#         log.info("ERA Port already running — reusing existing window.")
+#         return window
+#     except RuntimeError:
+#         pass
+
+#     log.info(f"Launching ERA Port from: {ERA_PORT_EXE}")
+#     if not os.path.exists(ERA_PORT_EXE):
+#         raise FileNotFoundError(
+#             f"ERA Port executable not found at: {ERA_PORT_EXE}\n"
+#             f"Update ERA_PORT_EXE in the config section at the top of this file."
+#         )
+
+#     subprocess.Popen([ERA_PORT_EXE], shell=True)
+#     log.info(f"Waiting {ERA_PORT_WAIT}s for ERA Port to start...")
+#     time.sleep(ERA_PORT_WAIT)
+
+#     # Find the window after launch
+#     window = find_era_window()
+#     log.info("ERA Port launched successfully.")
+#     return window
+
+
 # def go_to_main_menu(window):
 #     """
-#     Returns to the main menu from anywhere by pressing F9 or Escape.
-#     # TODO: Confirm the correct key to return to main menu in your eraPower setup
+#     Returns to the main menu from any screen.
+#     Sends ESC multiple times then navigates to main menu selection.
 #     """
 #     log.info("Returning to main menu...")
 #     window.set_focus()
-#     send_keys("{ESC}")
-#     time.sleep(WAIT_SHORT)
-#     send_keys("{ESC}")
+#     # Send ESC 3 times to back out of any sub-menu
+#     for _ in range(3):
+#         send_keys("{ESC}")
+#         time.sleep(WAIT_SHORT)
 #     time.sleep(WAIT_MEDIUM)
 
 
@@ -586,18 +627,22 @@
 
 # if __name__ == "__main__":
 #     """
-#     Quick test: logs into eraPower and looks up one part.
-#     Run this on the same machine as ERA Port to verify automation works.
+#     Test script: auto-launches ERA Port, logs in, looks up a part,
+#     saves result to JSON, then returns to main menu.
 #     """
-#     try:
-#         # Find and attach to ERA Port window
-#         era_window = find_era_window()
+#     # Output file for part lookup results
+#     # This JSON file is how eraPower results are shared with other modules (e.g. PartsCheck bot)
+#     OUTPUT_FILE = r"C:\Projects\pentana\era_results.json"
 
-#         # Login
+#     try:
+#         # Step 1: Launch ERA Port (or reuse if already open)
+#         era_window = launch_era_port()
+
+#         # Step 2: Login
 #         login(era_window)
 
-#         # Test: look up a known part
-#         # TODO: Replace with a real part number from your system
+#         # Step 3: Look up a test part
+#         # TODO: Replace with dynamic part numbers from PartsCheck orders
 #         result = lookup_part(era_window, "TO", "2321721010")
 
 #         if result:
@@ -607,13 +652,25 @@
 #             print(f"   Available:   {result['avail']}")
 #             print(f"   Sale Price:  ${result['sale_price']}")
 #             print(f"   List Price:  ${result['list_price']}")
+
+#             # Save result to JSON for use by other modules
+#             with open(OUTPUT_FILE, "w") as f:
+#                 json.dump(result, f, indent=2)
+#             print(f"\n💾 Result saved to: {OUTPUT_FILE}")
+
 #         else:
 #             print("❌ Part not found.")
 
+#         # Step 4: Return to main menu ready for next task
+#         go_to_main_menu(era_window)
+#         log.info("Returned to main menu. Ready for next task.")
+
+#     except FileNotFoundError as e:
+#         log.error(str(e))
 #     except Exception as e:
 #         log.error(f"Error: {e}")
 #         raise
-# 
+# ///////
 """
 eraPower Automation Module
 ==========================
@@ -640,8 +697,8 @@ from pywinauto.keyboard import send_keys
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-ERA_USERNAME       = "partscounter"
-ERA_PASSWORD       = "ap15cu6"
+ERA_USERNAME       = "YOUR_USERNAME"
+ERA_PASSWORD       = "YOUR_PASSWORD"
 ERA_WORKSTATION_ID = "429"
 
 # TODO: Update this path to the actual ERA Port executable on this machine
@@ -649,7 +706,7 @@ ERA_WORKSTATION_ID = "429"
 #   C:\Program Files\Ericom Software\PowerTerm\ptw32.exe
 #   C:\Program Files (x86)\ERA Port\eraport.exe
 #   C:\ERALink\ERALink1.wic  (session file — double-click to open)
-ERA_PORT_EXE  = r"C:\Program Files (x86)\ERALink Plus\wInteg.exe"
+ERA_PORT_EXE  = r"C:\ERALink\ERALink1.wic"
 ERA_PORT_WAIT = 5  # seconds to wait for ERA Port to launch
 
 # Menu selection codes
@@ -863,11 +920,10 @@ def navigate_to(window, menu_code):
 
 def launch_era_port():
     """
-    Launches ERA Port if it's not already running.
-    Waits for the login screen to appear before returning.
+    Launches ERA Port if not already running by opening the session file.
+    Windows opens the .wic file with wInteg.exe automatically.
     Returns the ERA Port window.
     """
-    # Check if already running
     try:
         window = find_era_window()
         log.info("ERA Port already running — reusing existing window.")
@@ -875,31 +931,68 @@ def launch_era_port():
     except RuntimeError:
         pass
 
-    log.info(f"Launching ERA Port from: {ERA_PORT_EXE}")
+    log.info(f"Launching ERA Port session: {ERA_PORT_EXE}")
     if not os.path.exists(ERA_PORT_EXE):
         raise FileNotFoundError(
-            f"ERA Port executable not found at: {ERA_PORT_EXE}\n"
+            f"Session file not found: {ERA_PORT_EXE}\n"
             f"Update ERA_PORT_EXE in the config section at the top of this file."
         )
 
-    subprocess.Popen([ERA_PORT_EXE], shell=True)
+    # Use shell=True to open .wic file the same way as double-clicking it
+    os.startfile(ERA_PORT_EXE)
     log.info(f"Waiting {ERA_PORT_WAIT}s for ERA Port to start...")
     time.sleep(ERA_PORT_WAIT)
 
-    # Find the window after launch
     window = find_era_window()
     log.info("ERA Port launched successfully.")
     return window
 
 
+def logoff_era(window):
+    """
+    Closes ERA Port completely and relaunches it.
+    This is the only reliable way to reset between tasks in eraPower.
+    After this function, ERA Port is open and sitting at the login screen.
+    """
+    import subprocess
+    log.info("Closing ERA Port...")
+
+    # Close the window
+    try:
+        window.close()
+        time.sleep(WAIT_LONG)
+    except Exception:
+        pass
+
+    # Force kill any remaining wInteg processes
+    try:
+        subprocess.call(["taskkill", "/f", "/im", "wInteg.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(WAIT_MEDIUM)
+    except Exception:
+        pass
+
+    log.info("ERA Port closed. Relaunching...")
+    time.sleep(WAIT_MEDIUM)
+
+    # Relaunch
+    os.startfile(ERA_PORT_EXE)
+    time.sleep(ERA_PORT_WAIT)
+
+    # Find the new window
+    new_window = find_era_window()
+    log.info("ERA Port relaunched. Ready for next login.")
+    return new_window
+
+
 def go_to_main_menu(window):
     """
-    Returns to the main menu from any screen.
-    Sends ESC multiple times then navigates to main menu selection.
+    Attempts to return to main menu using ESC.
+    If that fails, use logoff_era() instead which is more reliable.
+    # TODO: Test if ESC works from parts/quote screens in your setup
     """
     log.info("Returning to main menu...")
     window.set_focus()
-    # Send ESC 3 times to back out of any sub-menu
     for _ in range(3):
         send_keys("{ESC}")
         time.sleep(WAIT_SHORT)
@@ -966,17 +1059,21 @@ def parse_parts_result(screen_text, part_number):
     """
     Parses the Parts Inquiry result screen to extract pricing.
 
-    Screen layout example:
-        1  2321721010    FILTER SUCT 2221
-              3 CAR2            23.75    21.59
-              0/0               370      T4    5
+    Actual screen layout (from confirmed capture):
+        1 2321721010      FILTER SUCT 2ZZ1
+                3  CAR2                 23.75    21.59
+            0/0               370     T4        5
 
-    Returns dict or None.
+    The part number appears twice:
+      - Line "Part#(s) 2321721010"  ← skip this one
+      - Line "  1 2321721010   FILTER SUCT..."  ← this is the result line
 
-    # TODO: If eraPower screen layout changes, update the regex patterns below
+    Returns dict with keys: part_number, description, avail, sale_price, list_price
+    Returns None if part not found.
     """
     try:
-        lines = screen_text.split("\n")
+        # Normalize line endings — screen uses \r\n
+        lines = screen_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
         description = ""
         sale_price  = None
@@ -984,19 +1081,20 @@ def parse_parts_result(screen_text, part_number):
         avail       = None
 
         for i, line in enumerate(lines):
-            # Find the line containing our part number
-            if part_number in line:
-                # Description is on the same line after the part number
-                desc_match = re.search(
-                    rf"{re.escape(part_number)}\s+(.+)", line
-                )
+            # Skip the "Part#(s) XXXX" header line — we want the result line
+            # Result line starts with a line number (e.g. "  1 2321721010")
+            if part_number in line and not line.strip().startswith("Part#"):
+                # Extract description — everything after the part number
+                desc_match = re.search(rf"{re.escape(part_number)}\s+(.+)", line)
                 if desc_match:
                     description = desc_match.group(1).strip()
 
-                # Price line is typically the next line
-                # Format: "   3 CAR2   <spaces>   23.75    21.59"
+                # Price line is the NEXT line
+                # Format: "        3  CAR2                 23.75    21.59"
                 if i + 1 < len(lines):
                     price_line = lines[i + 1]
+
+                    # Extract all decimal numbers — first is sale, second is list
                     prices = re.findall(r"\d+\.\d{2}", price_line)
                     if len(prices) >= 2:
                         sale_price = float(prices[0])
@@ -1004,14 +1102,15 @@ def parse_parts_result(screen_text, part_number):
                     elif len(prices) == 1:
                         sale_price = float(prices[0])
 
-                # Availability — look for pattern like "3 CAR2"
-                avail_match = re.search(r"(\d+)\s+[A-Z]{2,}", price_line if i + 1 < len(lines) else "")
-                if avail_match:
-                    avail = int(avail_match.group(1))
+                    # Extract availability — pattern like "3  CAR2"
+                    avail_match = re.search(r"(\d+)\s+[A-Z]{2,4}", price_line)
+                    if avail_match:
+                        avail = int(avail_match.group(1))
 
                 break
 
         if sale_price is None:
+            log.warning("Could not find prices in screen text.")
             return None
 
         return {
@@ -1277,9 +1376,9 @@ if __name__ == "__main__":
         else:
             print("❌ Part not found.")
 
-        # Step 4: Return to main menu ready for next task
-        go_to_main_menu(era_window)
-        log.info("Returned to main menu. Ready for next task.")
+        # Step 4: Close and relaunch ERA Port ready for next task
+        era_window = logoff_era(era_window)
+        log.info("ERA Port ready for next task.")
 
     except FileNotFoundError as e:
         log.error(str(e))
