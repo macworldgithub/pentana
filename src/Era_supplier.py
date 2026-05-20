@@ -52,7 +52,7 @@ def lookup_supplier(window, search_term):
 
     Screen flow:
         2140 → type vendor number or partial name → Enter
-        → if multiple: list appears → type line number → Enter
+        → if multiple: list appears → type line number → Enterap15
         → vendor detail screen shows
     """
     log.info(f"Looking up supplier: '{search_term}'")
@@ -63,9 +63,14 @@ def lookup_supplier(window, search_term):
     window.set_focus()
     send_keys(search_term, pause=0.05)
     send_keys("{ENTER}")
+    time.sleep(WAIT_MEDIUM)      # wait for first enter to register
+    send_keys("{ENTER}")         # second enter
     time.sleep(WAIT_LONG)
 
     screen = read_screen_text(window)
+    print("=== RAW SCREEN ===")
+    print(screen)
+    print("==================")
 
     log.debug("=== SUPPLIER SEARCH RAW SCREEN ===")
     log.debug(repr(screen[:1000]))
@@ -152,62 +157,206 @@ def _parse_supplier_search_results(screen_text):
     return results
 
 
+# def _parse_supplier_detail(screen_text):
+#     result = {
+#         "vendor_number":   None,
+#         "name":            None,
+#         "sort_name":       None,
+#         "address":         None,
+#         "suburb":          None,
+#         "state":           None,
+#         "postcode":        None,
+#         "tel":             None,
+#         "email":           None,
+#         "fax":             None,
+#         "mobile":          None,
+#         "contact":         None,
+#         "payment_terms":   None,
+#         "comments":        None,
+#         "ytd_purchases":   None,
+#         "pyr_purchases":   None,
+#         "gst_reg_no":      None,
+#         "eft_active":      None,
+#         "remittance":      None,
+#     }
+
+#     m = re.search(r"Vendor\s*No\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["vendor_number"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Name\s*[:\|]\s*(.+?)(?:\s{2,}User|\|)", screen_text, re.IGNORECASE)
+#     if m: result["name"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Sort\s*Name\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+#     if m: result["sort_name"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Address\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+#     if m: result["address"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Suburb\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+#     if m: result["suburb"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+State\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+#     if m: result["state"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Postcode\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["postcode"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Tel\.\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+#     if m: result["tel"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Email\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["email"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Fax\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["fax"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Mobile\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["mobile"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Contact\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+#     if m: result["contact"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Terms\s*[:\|]\s*(.+?)(?:YTD|\|)", screen_text, re.IGNORECASE)
+#     if m: result["payment_terms"] = m.group(1).strip()
+
+#     m = re.search(r"YTD\s*Purchases\s*[:\|]\s*([\d,\.]+)", screen_text, re.IGNORECASE)
+#     if m: result["ytd_purchases"] = m.group(1).strip()
+
+#     m = re.search(r"PYR\s*Purchases\s*[:\|]\s*([\d,\.]+)", screen_text, re.IGNORECASE)
+#     if m: result["pyr_purchases"] = m.group(1).strip()
+
+#     m = re.search(r"\d+\s+Comments\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+#     if m: result["comments"] = m.group(1).strip()
+
+#     m = re.search(r"GST\s*Registration\s*No\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["gst_reg_no"] = m.group(1).strip()
+
+#     m = re.search(r"EFT\s*Active.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["eft_active"] = m.group(1).strip()
+
+#     m = re.search(r"Remittance\s*Advice.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+#     if m: result["remittance"] = m.group(1).strip()
+
+#     return result
+
 def _parse_supplier_detail(screen_text):
-    """
-    Parses the vendor info screen.
-
-    Extracts: vendor_number, name, phone, address, contact, abn, payment_terms
-
-    # TODO: Confirm exact field labels from live screen — ERA Power may
-    #       abbreviate labels differently (e.g. "Ph" vs "Phone", "Cont" vs "Contact").
-    """
     result = {
-        "vendor_number":  None,
-        "name":           None,
-        "phone":          None,
-        "address":        None,
-        "contact":        None,
-        "abn":            None,
-        "payment_terms":  None,
+        "vendor_number":        None,
+        "inactive":             None,
+        "name":                 None,
+        "user":                 None,
+        "sort_name":            None,
+        "address":              None,
+        "suburb":               None,
+        "state":                None,
+        "postcode":             None,
+        "tel":                  None,
+        "email":                None,
+        "fax":                  None,
+        "mobile":               None,
+        "contact":              None,
+        "payment_terms":        None,
+        "comments":             None,
+        "ytd_purchases":        None,
+        "pyr_purchases":        None,
+        "default_discount_pct": None,
+        "gst_charged_on_inv":   None,
+        "gst_reg_no":           None,
+        "eft_active":           None,
+        "withholding_tax":      None,
+        "remittance":           None,
+        "payment_group":        None,
+        "supplier_group":       None,
     }
 
-    # Vendor number
-    m = re.search(r"Vendor#?\s*[:\s]+([A-Z0-9\-]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["vendor_number"] = m.group(1).strip()
+    def clean(val):
+        """Strip pipes, underscores, whitespace — return None if empty."""
+        if not val:
+            return None
+        val = val.strip().strip("|").strip()
+        if not val or all(c in "_ " for c in val):
+            return None
+        return val
 
-    # Name
-    m = re.search(r"Name\s*[:\s]+(.+)", screen_text, re.IGNORECASE)
-    if m:
-        result["name"] = m.group(1).strip()
+    m = re.search(r"Vendor\s*No\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["vendor_number"] = clean(m.group(1))
 
-    # Phone
-    m = re.search(r"Ph(?:one)?\s*[:\s]+([\d\s\-\+\(\)]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["phone"] = m.group(1).strip()
+    m = re.search(r"Inactive\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["inactive"] = clean(m.group(1))
 
-    # Address
-    m = re.search(r"Addr(?:ess)?\s*[:\s]+(.+?)(?:\n|Phone|Ph|Contact|ABN|$)", screen_text, re.IGNORECASE | re.DOTALL)
-    if m:
-        result["address"] = m.group(1).strip()
+    m = re.search(r"\d+\s+Name\s*[:\|]\s*(.+?)(?:\s{2,}User|\|)", screen_text, re.IGNORECASE)
+    if m: result["name"] = clean(m.group(1))
 
-    # Contact person
-    m = re.search(r"Cont(?:act)?\s*[:\s]+(.+)", screen_text, re.IGNORECASE)
-    if m:
-        result["contact"] = m.group(1).strip()
+    m = re.search(r"User\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["user"] = clean(m.group(1))
 
-    # ABN
-    m = re.search(r"ABN\s*[:\s]+([\d\s]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["abn"] = m.group(1).strip()
+    m = re.search(r"\d+\s+Sort\s*Name\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+    if m: result["sort_name"] = clean(m.group(1))
 
-    # Payment terms
-    m = re.search(r"Terms?\s*[:\s]+(.+)", screen_text, re.IGNORECASE)
-    if m:
-        result["payment_terms"] = m.group(1).strip()
+    m = re.search(r"\d+\s+Address\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+    if m: result["address"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Suburb\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+    if m: result["suburb"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+State\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+    if m: result["state"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Postcode\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["postcode"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Tel\.\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+    if m: result["tel"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Email\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["email"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Fax\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["fax"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Mobile\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+    if m: result["mobile"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Contact\s*[:\|]\s*(.+?)(?:\s*\||\n)", screen_text, re.IGNORECASE)
+    if m: result["contact"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Terms\s*[:\|]\s*(.+?)(?:YTD|\|)", screen_text, re.IGNORECASE)
+    if m: result["payment_terms"] = clean(m.group(1))
+
+    m = re.search(r"YTD\s*Purchases\s*[:\|]\s*([\d,\.]+)", screen_text, re.IGNORECASE)
+    if m: result["ytd_purchases"] = clean(m.group(1))
+
+    m = re.search(r"PYR\s*Purchases\s*[:\|]\s*([\d,\.]+)", screen_text, re.IGNORECASE)
+    if m: result["pyr_purchases"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Comments\s*[:\|]\s*(.+?)(?:\s{2,}|\|)", screen_text, re.IGNORECASE)
+    if m: result["comments"] = clean(m.group(1))
+
+    m = re.search(r"Default\s*Discount\s*%\s*[:\|]\s*([\d\.]+)", screen_text, re.IGNORECASE)
+    if m: result["default_discount_pct"] = clean(m.group(1))
+
+    m = re.search(r"GST\s*Charged\s*on\s*Inv.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["gst_charged_on_inv"] = clean(m.group(1))
+
+    m = re.search(r"GST\s*Registration\s*No\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["gst_reg_no"] = clean(m.group(1))
+
+    m = re.search(r"EFT\s*Active.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["eft_active"] = clean(m.group(1))
+
+    m = re.search(r"Withholding\s*Tax.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["withholding_tax"] = clean(m.group(1))
+
+    m = re.search(r"Remittance\s*Advice.*?[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["remittance"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Pay(?:ment)?\s*Group\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["payment_group"] = clean(m.group(1))
+
+    m = re.search(r"\d+\s+Supplier\s*Group\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["supplier_group"] = clean(m.group(1))
 
     return result
-
 
 # ═══════════════════════════════════════════════════════════════
 #  STANDALONE TEST
