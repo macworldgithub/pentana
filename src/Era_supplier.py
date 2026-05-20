@@ -220,7 +220,7 @@ if __name__ == "__main__":
     )
 
     # ── hardcoded test value — replace with dynamic data in production ──
-    TEST_SEARCH = "BOSCH"
+    TEST_SEARCH = "14338"
 
     try:
         era_window = launch_era_port()
