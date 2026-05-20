@@ -72,7 +72,7 @@ def lookup_customer(window, search_term):
 
     # Type search term and press Enter
     window.set_focus()
-    send_keys(search_term, pause=0.05)
+    send_keys(search_term.replace(" ", "{SPACE}"), pause=0.05)
     send_keys("{ENTER}")
     time.sleep(WAIT_LONG)
 
@@ -271,7 +271,7 @@ if __name__ == "__main__":
     )
 
     # ── hardcoded test values — replace with dynamic data in production ──
-    TEST_SEARCH = "ABC"   # partial customer name to search
+    TEST_SEARCH = "Joel Hughe"   # partial customer name to search
 
     try:
         era_window = launch_era_port()
