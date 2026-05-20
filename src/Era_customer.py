@@ -20,8 +20,6 @@ import json
 import logging
 from pywinauto.keyboard import send_keys
 
-# ── reuse shared helpers from the main era_power module ──────────────────────
-# These are imported at runtime so this file can also run standalone
 try:
     from Era_power import (
         find_era_window, launch_era_port, login, logoff_era,
@@ -35,7 +33,6 @@ except ImportError:
 
 log = logging.getLogger("eraPower.customer")
 
-# Screen codes
 MENU_CUSTOMER = "2120"
 MENU_INVOICE  = "2525"
 
@@ -47,30 +44,11 @@ OUTPUT_FILE = r"C:\Projects\pentana\era_customer_result.json"
 # ═══════════════════════════════════════════════════════════════
 
 def lookup_customer(window, search_term):
-    """
-    Looks up a customer in screen 2120.
-
-    Args:
-        window:      ERA Port window
-        search_term: partial name (e.g. "ABC") or customer number (e.g. "10042")
-
-    Returns:
-        List of dicts if multiple results, or single dict if exact match.
-        Each dict: { line, customer_number, name }
-        Returns None if nothing found.
-
-    Screen flow:
-        2120 → input partial name or number → Enter
-        → search results list appears
-        → type line number → Enter
-        → basic customer info screen
-    """
     log.info(f"Looking up customer: '{search_term}'")
 
     navigate_to(window, MENU_CUSTOMER)
     time.sleep(WAIT_LONG)
 
-    # Type search term and press Enter
     window.set_focus()
     send_keys(search_term.replace(" ", "{SPACE}"), pause=0.05)
     send_keys("{ENTER}")
@@ -78,82 +56,74 @@ def lookup_customer(window, search_term):
 
     screen = read_screen_text(window)
 
-    log.debug("=== CUSTOMER SEARCH RAW SCREEN ===")
-    log.debug(repr(screen[:1000]))
+    # TEMP DEBUG — shows exactly what ERA copied from screen
+    print("=== RAW SCREEN (lookup) ===")
+    print(screen[:1500])
+    print("===========================")
 
-    # Check if we landed directly on a customer record (exact match)
+    # If search results list is showing, do NOT treat as direct match
+    if "Search Results" in screen:
+        log.info("Search results list detected.")
+        results = _parse_customer_search_results(screen)
+        if not results:
+            log.warning(f"No customers found for: '{search_term}'")
+            return None
+        log.info(f"Found {len(results)} customer(s).")
+        return results
+
+    # Direct match — landed straight on detail screen
     if _is_customer_detail_screen(screen):
         log.info("Direct match — on customer detail screen.")
         return [_parse_customer_detail(screen)]
 
-    # Otherwise parse the search results list
-    results = _parse_customer_search_results(screen)
-
-    if not results:
-        log.warning(f"No customers found for: '{search_term}'")
-        return None
-
-    log.info(f"Found {len(results)} customer(s).")
-    return results
+    log.warning(f"No customers found for: '{search_term}'")
+    return None
 
 
-def select_customer(window, line_number):
+def select_customer(window, search_term, line_number):
     """
-    After lookup_customer() returns a list, call this to pick one.
-    Types the line number and returns the customer detail dict.
-
-    Args:
-        window:      ERA Port window
-        line_number: int or str — the line number shown in search results
-
-    Returns:
-        dict: { customer_number, name, address, phone, credit_limit, balance }
+    Re-searches and picks a specific line number.
+    Called once per entry in a fresh ERA session.
     """
-    log.info(f"Selecting customer line: {line_number}")
+    log.info(f"Selecting line {line_number} for search: '{search_term}'")
+
+    navigate_to(window, MENU_CUSTOMER)
+    time.sleep(WAIT_LONG)
 
     window.set_focus()
+    send_keys(search_term.replace(" ", "{SPACE}"), pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(WAIT_LONG)
+
+    # Pick the line
     send_keys(str(line_number), pause=0.05)
     send_keys("{ENTER}")
     time.sleep(WAIT_LONG)
 
     screen = read_screen_text(window)
 
-    log.debug("=== CUSTOMER DETAIL RAW SCREEN ===")
-    log.debug(repr(screen[:1000]))
+    # TEMP DEBUG
+    print(f"=== RAW SCREEN (line {line_number}) ===")
+    print(screen[:1500])
+    print("========================================")
 
     return _parse_customer_detail(screen)
 
 
 def get_customer_credit_limit(window, customer_number):
-    """
-    Reads the credit limit for a customer.
-    Credit limits are visible in screen 2525 during invoicing.
-
-    Args:
-        window:          ERA Port window
-        customer_number: str
-
-    Returns:
-        float credit limit or None
-    """
     log.info(f"Getting credit limit for customer: {customer_number}")
 
     navigate_to(window, MENU_INVOICE)
     time.sleep(WAIT_LONG)
 
-    # Enter customer number to load their invoice screen
     window.set_focus()
-    send_keys("{ENTER}")           # skip invoice# field
+    send_keys("{ENTER}")
     time.sleep(WAIT_SHORT)
     send_keys(customer_number, pause=0.05)
     send_keys("{ENTER}")
     time.sleep(WAIT_LONG)
 
     screen = read_screen_text(window)
-
-    log.debug("=== CREDIT LIMIT RAW SCREEN ===")
-    log.debug(repr(screen[:800]))
-
     return _parse_credit_limit(screen)
 
 
@@ -162,98 +132,119 @@ def get_customer_credit_limit(window, customer_number):
 # ═══════════════════════════════════════════════════════════════
 
 def _is_customer_detail_screen(screen_text):
-    """Returns True if we're already on a customer detail page."""
-    indicators = ["Cust#", "Phone", "Credit", "Balance", "Address"]
+    """Returns True only if we are on the full customer detail page."""
+    if "Search Results" in screen_text:
+        return False
+    indicators = ["Entity ID", "First Name", "Last Name", "Street Add1", "Suburb", "Postal Code"]
     hits = sum(1 for kw in indicators if kw in screen_text)
-    return hits >= 2
-
+    return hits >= 4
 
 def _parse_customer_search_results(screen_text):
-    """
-    Parses the search results list screen.
-
-    Typical line format:
-        1   10042   ABC MOTORS PTY LTD
-        2   10089   ABCO ENGINEERING
-        3   10120   ABCDEF PARTS
-
-    Returns list of dicts: [{ line, customer_number, name }]
-
-    # TODO: Confirm exact column positions once tested against live screen.
-    #       Adjust regex if fields are fixed-width rather than space-delimited.
-    """
     results = []
     lines = screen_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     for line in lines:
-        # Match: line_num  customer_number  name
-        match = re.match(r"^\s*(\d+)\s+(\d{4,7})\s+(.+)$", line.strip())
+        # Format: |   1   381502 Joel Hughes      Test Test 3131                        S        |
+        match = re.match(r"^\|\s+(\d+)\s+(\d{6})\s+(.+?)\s{2,}(.*?)\s{2,}(\S+)\s*\|$", line)
         if match:
             results.append({
                 "line":            int(match.group(1)),
                 "customer_number": match.group(2).strip(),
                 "name":            match.group(3).strip(),
+                "address":         match.group(4).strip(),
+                "phone":           "",
+                "type":            match.group(5).strip(),
             })
 
     return results
 
-
 def _parse_customer_detail(screen_text):
     """
-    Parses the basic customer info screen.
+    Parses the customer detail screen (Entity Master).
 
-    Extracts: customer_number, name, address, phone, credit_limit, balance
-
-    # TODO: Confirm field labels once tested against live screen.
-    #       ERA Power may use abbreviated labels — update patterns to match.
+    Fields visible on screen:
+        Entity ID, Business, First Name, Middle Name, Last Name,
+        Street Add1, Street Add2, Suburb, Postal Code, State, Country,
+        Entity Type, Customer Type, Preferred, Sort Name,
+        Contact Type, Salutation, Title, Attention, Privacy Cde
     """
     result = {
-        "customer_number": None,
-        "name":            None,
-        "address":         None,
-        "phone":           None,
-        "credit_limit":    None,
-        "balance":         None,
+        "entity_id":     None,
+        "business":      None,
+        "first_name":    None,
+        "middle_name":   None,
+        "last_name":     None,
+        "name":          None,
+        "street_add1":   None,
+        "street_add2":   None,
+        "suburb":        None,
+        "postal_code":   None,
+        "state":         None,
+        "country":       None,
+        "entity_type":   None,
+        "customer_type": None,
+        "contact_type":  None,
+        "preferred":     None,
+        "sort_name":     None,
     }
 
-    # Customer number
-    m = re.search(r"Cust#?\s*[:\s]+(\d+)", screen_text, re.IGNORECASE)
-    if m:
-        result["customer_number"] = m.group(1).strip()
+    m = re.search(r"Entity\s*ID\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["entity_id"] = m.group(1).strip()
 
-    # Name
-    m = re.search(r"Name\s*[:\s]+(.+)", screen_text, re.IGNORECASE)
-    if m:
-        result["name"] = m.group(1).strip()
+    m = re.search(r"(?:1\.\s*)?Business\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["business"] = m.group(1).strip()
 
-    # Phone
-    m = re.search(r"Phone\s*[:\s]+([\d\s\-\+\(\)]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["phone"] = m.group(1).strip()
+    m = re.search(r"(?:2\.\s*)?First\s*N(?:ame)?\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["first_name"] = m.group(1).strip()
 
-    # Address — grab everything after "Address" or "Addr" up to next field
-    m = re.search(r"Addr(?:ess)?\s*[:\s]+(.+?)(?:\n|Phone|Credit|$)", screen_text, re.IGNORECASE | re.DOTALL)
-    if m:
-        result["address"] = m.group(1).strip()
+    m = re.search(r"(?:3\.\s*)?Middle\s*N(?:ame)?\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["middle_name"] = m.group(1).strip()
 
-    # Credit limit
-    m = re.search(r"Credit\s*(?:Limit)?\s*[:\s]+([\d,\.]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["credit_limit"] = float(m.group(1).replace(",", ""))
+    m = re.search(r"(?:4\.\s*)?Last\s*N(?:ame)?\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["last_name"] = m.group(1).strip()
 
-    # Balance
-    m = re.search(r"Balance\s*[:\s]+([\d,\.]+)", screen_text, re.IGNORECASE)
-    if m:
-        result["balance"] = float(m.group(1).replace(",", ""))
+    if result["first_name"] and result["last_name"]:
+        result["name"] = f"{result['first_name']} {result['last_name']}"
+    elif result["business"]:
+        result["name"] = result["business"]
+
+    m = re.search(r"(?:7\.\s*)?Street\s*Add1\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["street_add1"] = m.group(1).strip()
+
+    m = re.search(r"(?:8\.\s*)?Street\s*Add2\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["street_add2"] = m.group(1).strip()
+
+    m = re.search(r"(?:9\.\s*)?Suburb\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["suburb"] = m.group(1).strip()
+
+    m = re.search(r"(?:10\.\s*)?Postal\s*Code\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["postal_code"] = m.group(1).strip()
+
+    m = re.search(r"(?:11\.\s*)?State\s*[:\|]\s*(\S+)", screen_text, re.IGNORECASE)
+    if m: result["state"] = m.group(1).strip()
+
+    m = re.search(r"(?:12\.\s*)?Country\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["country"] = m.group(1).strip()
+
+    m = re.search(r"Entity\s*Type\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["entity_type"] = m.group(1).strip()
+
+    m = re.search(r"Cust(?:omer)?\s*Type\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["customer_type"] = m.group(1).strip()
+
+    m = re.search(r"(?:19\.\s*)?Contact\s*Type\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["contact_type"] = m.group(1).strip()
+
+    m = re.search(r"(?:5\.\s*)?Preferred\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["preferred"] = m.group(1).strip()
+
+    m = re.search(r"(?:6\.\s*)?Sort\s*N(?:ame)?\s*[:\|]\s*(.+?)(?:\s*\||\n|$)", screen_text, re.IGNORECASE)
+    if m: result["sort_name"] = m.group(1).strip()
 
     return result
 
 
 def _parse_credit_limit(screen_text):
-    """
-    Extracts credit limit value from screen 2525.
-    # TODO: Confirm exact label used in 2525 for credit limit field.
-    """
     m = re.search(r"Credit\s*(?:Limit)?\s*[:\s]+([\d,\.]+)", screen_text, re.IGNORECASE)
     if m:
         return float(m.group(1).replace(",", ""))
@@ -270,45 +261,64 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    # ── hardcoded test values — replace with dynamic data in production ──
-    TEST_SEARCH = "Joel Hughe"   # partial customer name to search
+    TEST_SEARCH = "Joel Hughe"
 
     try:
         era_window = launch_era_port()
         login(era_window)
 
-        # Step 1: Search
+        # First pass — just to count how many entries exist
         results = lookup_customer(era_window, TEST_SEARCH)
 
         if not results:
             print("❌ No customers found.")
-        elif len(results) == 1:
-            # Direct hit or single result
+            era_window = logoff_era(era_window)
+
+        elif len(results) == 1 and results[0].get("entity_id"):
+            # Direct detail hit — already parsed
             customer = results[0]
-            print("\n✅ Customer found (direct):")
-        else:
-            # Multiple results — print list and pick first for test
-            print(f"\n✅ Found {len(results)} customers:")
-            for r in results:
-                print(f"   [{r['line']}] {r['customer_number']} — {r['name']}")
-
-            # Step 2: Select line 1 for test
-            print("\nSelecting line 1...")
-            customer = select_customer(era_window, 1)
-
-        if results:
-            print(f"\n   Customer#:    {customer.get('customer_number')}")
+            print("\n✅ Single customer found (direct):")
+            print(f"   Entity ID:    {customer.get('entity_id')}")
             print(f"   Name:         {customer.get('name')}")
-            print(f"   Phone:        {customer.get('phone')}")
-            print(f"   Address:      {customer.get('address')}")
-            print(f"   Credit Limit: ${customer.get('credit_limit')}")
-            print(f"   Balance:      ${customer.get('balance')}")
+            print(f"   Street:       {customer.get('street_add1')}")
+            print(f"   Suburb:       {customer.get('suburb')}")
+            print(f"   State:        {customer.get('state')}")
+            print(f"   Postal Code:  {customer.get('postal_code')}")
+            print(f"   Entity Type:  {customer.get('entity_type')}")
+            print(f"   Customer Type:{customer.get('customer_type')}")
 
             with open(OUTPUT_FILE, "w") as f:
                 json.dump(customer, f, indent=2)
             print(f"\n💾 Saved to: {OUTPUT_FILE}")
 
-        era_window = logoff_era(era_window)
+            era_window = logoff_era(era_window)
+
+        else:
+            # Multiple entries — loop through each one
+            # results list gives us the count (e.g. 3)
+            total_lines = len(results)
+            print(f"\n✅ Found {total_lines} entries:")
+            for r in results:
+                print(f"   [{r['line']}] {r['customer_number']} — {r['name']} — {r['address']}")
+
+            all_customers = []
+
+            for i in range(1, total_lines + 1):
+                print(f"\n--- Fetching entry {i} of {total_lines} ---")
+
+                # Close and reopen ERA fresh for each entry
+                era_window = logoff_era(era_window)
+                login(era_window)
+
+                customer = select_customer(era_window, TEST_SEARCH, i)
+                all_customers.append(customer)
+                print(f"   ✅ {customer.get('name')} — {customer.get('street_add1')}, {customer.get('suburb')}")
+
+            with open(OUTPUT_FILE, "w") as f:
+                json.dump(all_customers, f, indent=2)
+            print(f"\n💾 All {total_lines} customers saved to: {OUTPUT_FILE}")
+
+            era_window = logoff_era(era_window)
 
     except Exception as e:
         log.error(f"Error: {e}")

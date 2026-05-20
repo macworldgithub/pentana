@@ -42,9 +42,9 @@ MENU_QUOTE         = "2525"
 MENU_SUPPLIER      = "2140"
 
 # Timing — increase if system is slow
-WAIT_SHORT  = 0.5
-WAIT_MEDIUM = 1.0
-WAIT_LONG   = 2.0
+WAIT_SHORT  = 1.5
+WAIT_MEDIUM = 2.5
+WAIT_LONG   = 3.5
 
 # ─────────────────────────────────────────────
 #  MAKE CODES
