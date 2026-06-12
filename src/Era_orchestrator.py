@@ -1,489 +1,450 @@
 """
-ERA Power — Orchestrator
-=========================
-Ties all ERA Power modules together into one pipeline.
-
-Handles:
-  - Single ERA Power session (queue-safe for multiple concurrent offers)
-  - Per-offer state objects
-  - Price comparison logic
-  - Requote loop with max attempt cap
-  - Invoice creation only after confirmed win
-
-Architecture:
-  Each PartsCheck offer becomes a "job" dict.
-  Jobs are queued and processed one at a time through ERA Power.
-  PartsCheck interaction (submit price, wait for reveal, read result)
-  is handled by the separate partscheck.py module (to be built).
-
-Usage:
-    py -3.14 era_orchestrator.py                  # runs test with hardcoded jobs
-    from era_orchestrator import Orchestrator      # import into partscheck module
-
-Directory layout expected:
-    era_power.py          ← original (parts inquiry + helpers)
-    era_customer.py       ← customer lookup
-    era_supplier.py       ← supplier lookup
-    era_quote.py          ← quote + invoice
-    era_orchestrator.py   ← this file
+ERA Power Orchestrator
+Controls the workflow between ERA Power, PartsCheck, and Parts Finder.
 """
-
 import time
 import json
+import uuid
 import queue
 import logging
 import threading
+import traceback
+import os
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Dict, Optional, Any
 
-from Era_power    import launch_era_port, login, logoff_era, lookup_part, MAKE_CODES
-from Era_customer import lookup_customer, select_customer
-from Era_supplier import lookup_supplier, select_supplier
-from Era_quote    import create_quote, requote, convert_to_invoice
+from Era_power import launch_era_port, login, logoff_era, lookup_part, MAKE_CODES
+from Era_customer import lookup_customer
+from Era_quote import create_quote, create_sales_order
+from partscheck import PartsCheckModule
+from parts_finder import PartsFinderModule
 
 log = logging.getLogger("eraPower.orchestrator")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# Load Config
+CONFIG_FILE = r"C:\Projects\pentana\era_config.json"
+try:
+    with open(CONFIG_FILE, "r") as f:
+        CONFIG = json.load(f)
+except Exception as e:
+    log.warning(f"Failed to load config from {CONFIG_FILE}: {e}")
+    CONFIG = {}
 
-# ── Configuration ────────────────────────────────────────────────────────────
-MAX_REQUOTES   = 3          # max times we'll lower our price per offer
-RESULTS_FILE   = r"C:\Projects\pentana\era_results_log.json"
+# Constants from config
+PATHS = CONFIG.get("paths", {})
+RESULTS_LOG = PATHS.get("results_log", r"C:\Projects\pentana\era_results_log.json")
+ERROR_LOG = PATHS.get("error_log", r"C:\Projects\pentana\era_errors.json")
+DLQ_FILE = PATHS.get("dead_letter_queue", r"C:\Projects\pentana\dead_letter_queue.json")
 
+# Ensure directory exists for logs
+os.makedirs(os.path.dirname(RESULTS_LOG), exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════
-#  JOB / STATE OBJECT
-# ═══════════════════════════════════════════════════════════════
+MARGIN_RULES = CONFIG.get("margin_rules", {})
+REQUOTE_RULES = CONFIG.get("requote_rules", {})
+
+MAX_REQUOTE_ATTEMPTS = REQUOTE_RULES.get("max_requote_attempts", 3)
+UNDERCUT_FIXED = REQUOTE_RULES.get("undercut_fixed_amount", 0.50)
+MIN_IMPROVEMENT = REQUOTE_RULES.get("min_improvement_threshold", 1.00)
+
+class RequestStatus:
+    PENDING = "PENDING"
+    CUSTOMER_LOOKING_UP = "CUSTOMER_LOOKING_UP"
+    CUSTOMER_FOUND = "CUSTOMER_FOUND"
+    CUSTOMER_NOT_FOUND = "CUSTOMER_NOT_FOUND"
+    PARTS_PROCESSING = "PARTS_PROCESSING"
+    QUOTE_CREATING = "QUOTE_CREATING"
+    QUOTE_CREATED = "QUOTE_CREATED"
+    FIRST_QUOTE_SUBMITTED = "FIRST_QUOTE_SUBMITTED"
+    WAITING_COMPETITOR_PRICES = "WAITING_COMPETITOR_PRICES"
+    COMPETITOR_PRICES_CAPTURED = "COMPETITOR_PRICES_CAPTURED"
+    REQUOTE_CALCULATING = "REQUOTE_CALCULATING"
+    REQUOTE_SUBMITTED = "REQUOTE_SUBMITTED"
+    WON = "WON"
+    LOST = "LOST"
+    WALKED = "WALKED"
+    INVOICED = "INVOICED"
+    ERROR = "ERROR"
+
+class LineItemStatus:
+    PENDING = "PENDING"
+    MAKE_RESOLVING = "MAKE_RESOLVING"
+    MAKE_RESOLVED = "MAKE_RESOLVED"
+    MAKE_NOT_FOUND = "MAKE_NOT_FOUND"
+    ERA_LOOKING_UP = "ERA_LOOKING_UP"
+    ERA_FOUND = "ERA_FOUND"
+    ERA_NOT_FOUND = "ERA_NOT_FOUND"
+    PRICE_CALCULATING = "PRICE_CALCULATING"
+    PRICE_READY = "PRICE_READY"
+    CANNOT_COMPETE = "CANNOT_COMPETE"
+    REQUOTED = "REQUOTED"
+    NO_ACTION_NEEDED = "NO_ACTION_NEEDED"
 
 @dataclass
-class OfferJob:
-    """
-    Represents one PartsCheck offer going through the full pipeline.
-    One of these per active offer. Orchestrator holds the list.
+class LineItem:
+    line_item_id: str
+    raw_description: str
+    rough_part_number: str
+    make: str
+    qty: int
+    
+    status: str = LineItemStatus.PENDING
+    make_code: Optional[str] = None
+    confirmed_part_number: Optional[str] = None
+    
+    # ERA Power data
+    era_description: str = ""
+    era_sale_price: float = 0.0
+    era_list_price: float = 0.0
+    era_avail: int = 0
+    
+    # Calculated
+    floor_price: float = 0.0
+    initial_quote_price: float = 0.0
+    current_quote_price: float = 0.0
+    
+    competitor_prices: List[float] = field(default_factory=list)
 
-    Fields populated at each stage:
-      Stage 1 (ERA Power lookup):   our_cost, our_sell_price, floor_price
-      Stage 2 (PartsCheck submit):  partscheck_offer_id, submitted_price
-      Stage 3 (Price reveal):       competitor_prices, lowest_competitor
-      Stage 4 (Decision):           won / requote / walk_away
-      Stage 5 (Invoice):            quote_number, invoice_number
-    """
-    # Input — from PartsCheck (hardcoded for now, dynamic later)
-    offer_id:         str   = ""
-    make:             str   = ""          # e.g. "toyota"
-    part_number:      str   = ""
-    qty:              int   = 1
-    customer_search:  str   = ""          # name or number
-
-    # Derived — from ERA Power lookup
-    make_code:        str   = ""          # e.g. "TO"
-    description:      str   = ""
-    our_sell_price:   float = 0.0
-    our_list_price:   float = 0.0
-    floor_price:      float = 0.0         # minimum we'll sell at
-    avail:            int   = 0
-
-    # PartsCheck state
-    submitted_price:      float = 0.0
-    partscheck_offer_id:  str   = ""
-    competitor_prices:    List[float] = field(default_factory=list)
-    lowest_competitor:    float = 0.0
-
-    # Quote / invoice
-    quote_number:    Optional[str] = None
-    invoice_number:  Optional[str] = None
-
-    # Control
-    requote_attempts: int  = 0
-    status:           str  = "pending"    # pending | quoted | won | lost | walked | invoiced | error
-    started_at:       str  = ""
-    finished_at:      str  = ""
-    notes:            str  = ""
-
-
-# ═══════════════════════════════════════════════════════════════
-#  ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════
+@dataclass
+class Job:
+    quote_request_id: str
+    partscheck_offer_id: str
+    customer_search: str
+    deadline: datetime
+    repairer_details: dict
+    parts: List[LineItem] = field(default_factory=list)
+    
+    status: str = RequestStatus.PENDING
+    customer_entity_id: Optional[str] = None
+    quote_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    requote_attempts: int = 0
+    
+    history: List[str] = field(default_factory=list)
 
 class Orchestrator:
-    """
-    Single ERA Power session. Processes jobs from a queue one at a time.
-
-    If ERA Power turns out to support multiple sessions, replace the
-    single _window with a pool and remove the queue — each job gets
-    its own window. The job/state logic stays identical.
-    """
-
     def __init__(self):
-        self._window    = None
+        self._window = None
         self._job_queue = queue.Queue()
-        self._results   = []
-        self._lock      = threading.Lock()
-        self._running   = False
-
-    # ── Lifecycle ─────────────────────────────────────────────
-
-    def start(self):
-        """Launch ERA Power, log in, start processing queue."""
-        log.info("Starting orchestrator...")
-        self._window  = launch_era_port()
-        login(self._window)
-        self._running = True
-        log.info("ERA Power ready. Orchestrator running.")
-
-    def stop(self):
-        """Shut down ERA Power and save results log."""
         self._running = False
-        log.info("Stopping orchestrator...")
-        if self._window:
-            self._window = logoff_era(self._window)
-        self._save_results()
-        log.info("Orchestrator stopped.")
+        self._lock = threading.Lock()
+        
+        self.partscheck = PartsCheckModule()
+        self.partsfinder = PartsFinderModule()
 
-    def add_job(self, job: OfferJob):
-        """
-        Add a new offer job to the queue.
-        Called by the PartsCheck module when a new offer is detected.
-        """
-        job.started_at = datetime.now().isoformat()
-        log.info(f"Job queued: {job.offer_id} — {job.make} {job.part_number}")
+    def _log_action(self, job: Job, item: Optional[LineItem], action: str, result: str, prices: str, reason: str):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        item_str = f"[{item.line_item_id}]" if item else "[]"
+        log_msg = f"{timestamp} [INFO] [{job.quote_request_id}] {item_str} {action}: result={result} prices={prices} reason={reason}"
+        log.info(log_msg)
+        job.history.append(log_msg)
+        self._save_results(job)
+
+    def _save_results(self, job: Job):
+        try:
+            results = []
+            if os.path.exists(RESULTS_LOG):
+                with open(RESULTS_LOG, "r") as f:
+                    results = json.load(f)
+            
+            # Simple update or append
+            for i, r in enumerate(results):
+                if r.get("quote_request_id") == job.quote_request_id:
+                    results[i] = self._job_to_dict(job)
+                    break
+            else:
+                results.append(self._job_to_dict(job))
+                
+            with open(RESULTS_LOG, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+        except Exception as e:
+            log.error(f"Failed to save results log: {e}")
+
+    def _send_to_dlq(self, job: Job, error_msg: str):
+        try:
+            dlq = []
+            if os.path.exists(DLQ_FILE):
+                with open(DLQ_FILE, "r") as f:
+                    dlq = json.load(f)
+            job_dict = self._job_to_dict(job)
+            job_dict["error"] = error_msg
+            dlq.append(job_dict)
+            with open(DLQ_FILE, "w") as f:
+                json.dump(dlq, f, indent=2, default=str)
+        except Exception as e:
+            log.error(f"Failed to write to DLQ: {e}")
+
+    def _job_to_dict(self, job: Job) -> dict:
+        import copy
+        j_dict = copy.deepcopy(job.__dict__)
+        j_dict["parts"] = [p.__dict__ for p in job.parts]
+        return j_dict
+
+    def generate_ids(self, raw_job: dict) -> Job:
+        date_str = datetime.now().strftime("%Y%m%d")
+        uuid_str = str(uuid.uuid4())[:8]
+        req_id = f"QR-{date_str}-{uuid_str}"
+        
+        job = Job(
+            quote_request_id=req_id,
+            partscheck_offer_id=raw_job.get("partscheck_offer_id", ""),
+            customer_search=raw_job.get("customer_search", ""),
+            deadline=raw_job.get("deadline", datetime.now()),
+            repairer_details=raw_job.get("repairer_details", {})
+        )
+        
+        for idx, part_data in enumerate(raw_job.get("parts", []), start=1):
+            line_item_id = f"{req_id}-LI-{idx:02d}"
+            item = LineItem(
+                line_item_id=line_item_id,
+                raw_description=part_data.get("raw_description", ""),
+                rough_part_number=part_data.get("rough_part_number", ""),
+                make=part_data.get("make", ""),
+                qty=part_data.get("qty", 1)
+            )
+            job.parts.append(item)
+            
+        return job
+
+    def add_job(self, raw_job: dict):
+        job = self.generate_ids(raw_job)
+        self._log_action(job, None, "Job Created", "SUCCESS", "", "Incoming request")
         self._job_queue.put(job)
 
-    def run_loop(self):
-        """
-        Main processing loop. Blocks until stop() is called.
-        In production, run this in a background thread so the
-        PartsCheck module can keep adding jobs concurrently.
-        """
+    def _retry_call(self, func, *args, **kwargs):
+        """Retries an ERA Power function call with exponential backoff (2s, 4s, 8s)."""
+        delays = [2, 4, 8]
+        for attempt in range(4):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if attempt < 3:
+                    log.warning(f"Call failed: {e}. Retrying in {delays[attempt]}s...")
+                    time.sleep(delays[attempt])
+                else:
+                    log.error(f"Call failed after 3 retries: {e}")
+                    raise
+
+    def process_job(self, job: Job):
+        try:
+            self._process_steps(job)
+        except Exception as e:
+            job.status = RequestStatus.ERROR
+            error_msg = f"Job failed: {str(e)}\n{traceback.format_exc()}"
+            self._log_action(job, None, "Job Error", "ERROR", "", error_msg)
+            self._send_to_dlq(job, error_msg)
+
+    def _process_steps(self, job: Job):
+        # STEP 1: Customer Lookup
+        job.status = RequestStatus.CUSTOMER_LOOKING_UP
+        self._log_action(job, None, "Customer Lookup", "STARTED", "", job.customer_search)
+        
+        cust_result = self._retry_call(lookup_customer, self._window, job.customer_search)
+        if not cust_result:
+            job.status = RequestStatus.CUSTOMER_NOT_FOUND
+            self._log_action(job, None, "Customer Lookup", "FAILED", "", "Not found in ERA")
+            raise Exception("Customer not found in ERA Power")
+            
+        if isinstance(cust_result, list):
+            cust_result = cust_result[0] # Take first result as per requirements
+            
+        job.customer_entity_id = cust_result.get("entity_id") or cust_result.get("customer_number")
+        
+        job.status = RequestStatus.CUSTOMER_FOUND
+        self._log_action(job, None, "Customer Lookup", "SUCCESS", "", f"ID: {job.customer_entity_id}")
+
+        # STEP 2: Parts Lookup
+        job.status = RequestStatus.PARTS_PROCESSING
+        valid_parts = []
+        for item in job.parts:
+            # 2a) Resolve make
+            item.status = LineItemStatus.MAKE_RESOLVING
+            make_normalized = item.make.lower().strip()
+            make_code = MAKE_CODES.get(make_normalized)
+            if not make_code:
+                for k, v in MAKE_CODES.items():
+                    if k in make_normalized or make_normalized in k:
+                        make_code = v
+                        break
+                        
+            if not make_code:
+                item.status = LineItemStatus.MAKE_NOT_FOUND
+                self._log_action(job, item, "Resolve Make", "FAILED", "", f"Make: {item.make}")
+                continue
+                
+            item.make_code = make_code
+            item.status = LineItemStatus.MAKE_RESOLVED
+            
+            # Parts Finder Lookup
+            pf_result = self.partsfinder.find_part(item.raw_description, item.rough_part_number, item.make)
+            item.confirmed_part_number = pf_result.get("confirmed_part_number", item.rough_part_number)
+            
+            # 2b) ERA Lookup
+            item.status = LineItemStatus.ERA_LOOKING_UP
+            part_info = self._retry_call(lookup_part, self._window, item.make_code, item.confirmed_part_number)
+            
+            if not part_info:
+                item.status = LineItemStatus.ERA_NOT_FOUND
+                self._log_action(job, item, "ERA Lookup", "FAILED", "", f"Part: {item.confirmed_part_number}")
+                continue
+                
+            item.era_description = part_info.get("description", "")
+            item.era_sale_price = part_info.get("sale_price", 0.0)
+            item.era_list_price = part_info.get("list_price", 0.0)
+            item.era_avail = part_info.get("avail", 0)
+            item.status = LineItemStatus.ERA_FOUND
+            self._log_action(job, item, "ERA Lookup", "SUCCESS", f"sale={item.era_sale_price} list={item.era_list_price}", f"avail={item.era_avail}")
+            valid_parts.append(item)
+
+        if not valid_parts:
+            job.status = RequestStatus.ERROR
+            raise Exception("No valid parts found in ERA Power")
+
+        # STEP 3: Price Calculation
+        for item in valid_parts:
+            item.status = LineItemStatus.PRICE_CALCULATING
+            
+            brand_margin = MARGIN_RULES.get("by_brand", {}).get(item.make_code, MARGIN_RULES.get("by_brand", {}).get("default", 0.10))
+            cat_margin = MARGIN_RULES.get("by_category", {}).get("default", 0.15) 
+            
+            margin = max(brand_margin, cat_margin)
+            item.floor_price = item.era_list_price + (item.era_list_price * margin)
+            item.initial_quote_price = item.era_sale_price
+            item.current_quote_price = item.initial_quote_price
+            
+            item.status = LineItemStatus.PRICE_READY
+            self._log_action(job, item, "Price Calc", "SUCCESS", f"floor={item.floor_price:.2f} quote={item.initial_quote_price:.2f}", f"margin={margin}")
+
+        # STEP 4: Create Quote in ERA Power
+        job.status = RequestStatus.QUOTE_CREATING
+        era_parts_list = [
+            {"part_number": item.confirmed_part_number, "qty": item.qty, "sale_price": item.current_quote_price}
+            for item in valid_parts
+        ]
+        make_code = valid_parts[0].make_code
+        
+        quote_result = self._retry_call(create_quote, self._window, make_code, str(job.customer_entity_id), era_parts_list)
+        if quote_result and quote_result.get("quote_number"):
+            job.quote_number = quote_result.get("quote_number")
+            job.status = RequestStatus.QUOTE_CREATED
+            self._log_action(job, None, "ERA Quote", "SUCCESS", "", f"Quote# {job.quote_number}")
+        else:
+            raise Exception("Quote creation failed")
+
+        # STEP 5: Hand off to PartsCheck
+        self.partscheck.submit_quote(job)
+        job.status = RequestStatus.FIRST_QUOTE_SUBMITTED
+        self._log_action(job, None, "PartsCheck Submit", "SUCCESS", "", "Initial quote submitted")
+
+        # STEP 6: Wait for competitor prices
+        job.status = RequestStatus.WAITING_COMPETITOR_PRICES
+        
+        time.sleep(2)
+        comp_prices = self.partscheck.get_competitor_prices(job)
+        if comp_prices:
+            for item in valid_parts:
+                item.competitor_prices = comp_prices.get(item.line_item_id, [])
+            job.status = RequestStatus.COMPETITOR_PRICES_CAPTURED
+            self._log_action(job, None, "Competitor Prices", "SUCCESS", "", f"Received for {len(comp_prices)} items")
+            self._requote_decision(job, valid_parts, make_code)
+        else:
+            self._log_action(job, None, "Competitor Prices", "EMPTY", "", "No competitor prices found")
+            self._win_loss_handling(job, valid_parts, make_code)
+
+
+    def _requote_decision(self, job: Job, valid_parts: List[LineItem], make_code: str):
+        job.status = RequestStatus.REQUOTE_CALCULATING
+        any_improved = False
+        
+        for item in valid_parts:
+            if not item.competitor_prices:
+                item.status = LineItemStatus.NO_ACTION_NEEDED
+                continue
+                
+            lowest_comp = min(item.competitor_prices)
+            if item.current_quote_price <= lowest_comp:
+                item.status = LineItemStatus.NO_ACTION_NEEDED
+                self._log_action(job, item, "Requote Calc", "SKIP", f"ours={item.current_quote_price} comp={lowest_comp}", "Already lowest")
+                continue
+                
+            target_price = lowest_comp - UNDERCUT_FIXED
+            
+            if target_price < item.floor_price:
+                item.status = LineItemStatus.CANNOT_COMPETE
+                self._log_action(job, item, "Requote Calc", "SKIP", f"target={target_price} floor={item.floor_price}", "Below floor")
+                continue
+                
+            if (item.current_quote_price - target_price) < MIN_IMPROVEMENT:
+                item.status = LineItemStatus.CANNOT_COMPETE
+                self._log_action(job, item, "Requote Calc", "SKIP", f"diff={item.current_quote_price - target_price}", "Below min improvement")
+                continue
+                
+            item.current_quote_price = target_price
+            item.status = LineItemStatus.REQUOTED
+            any_improved = True
+            self._log_action(job, item, "Requote Calc", "SUCCESS", f"new_price={item.current_quote_price}", "Beats competitor")
+
+        if any_improved:
+            self.partscheck.submit_quote(job)
+            job.status = RequestStatus.REQUOTE_SUBMITTED
+            self._log_action(job, None, "Requote Submit", "SUCCESS", "", "Updated quote submitted to PartsCheck")
+        else:
+            job.status = RequestStatus.WALKED
+            self._log_action(job, None, "Requote Decision", "WALKED", "", "No parts could be competitively improved")
+            
+        self._win_loss_handling(job, valid_parts, make_code)
+
+    def _win_loss_handling(self, job: Job, valid_parts: List[LineItem], make_code: str):
+        is_won = True # STUB
+        
+        if is_won:
+            job.status = RequestStatus.WON
+            era_parts_list = [
+                {"part_number": item.confirmed_part_number, "qty": item.qty, "sale_price": item.current_quote_price}
+                for item in valid_parts
+            ]
+            
+            so_result = self._retry_call(create_sales_order, self._window, make_code, str(job.customer_entity_id), era_parts_list)
+            if so_result and so_result.get("invoice_number"):
+                job.invoice_number = so_result.get("invoice_number")
+                job.status = RequestStatus.INVOICED
+                self._log_action(job, None, "Sales Order", "SUCCESS", "", f"Invoice# {job.invoice_number}")
+            else:
+                self._log_action(job, None, "Sales Order", "FAILED", "", "Invoice creation failed")
+        else:
+            job.status = RequestStatus.LOST
+            self._log_action(job, None, "Outcome", "LOST", "", "Lost quote")
+
+    def run(self):
+        log.info("Starting Orchestrator...")
+        self._window = launch_era_port()
+        login(self._window)
+        self._running = True
+        
         while self._running or not self._job_queue.empty():
             try:
                 job = self._job_queue.get(timeout=2)
-                self._process_job(job)
+                self.process_job(job)
                 self._job_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
-                log.error(f"Unhandled error in job loop: {e}")
+                log.error(f"Queue loop error: {e}")
 
-    # ── Job Processing ────────────────────────────────────────
-
-    def _process_job(self, job: OfferJob):
-        """
-        Full pipeline for one offer:
-          1. Resolve make code
-          2. Look up part in ERA Power
-          3. Calculate floor price
-          4. Submit to PartsCheck  ← partscheck module handles this
-          5. Wait for reveal        ← partscheck module handles this
-          6. Compare prices
-          7. Requote loop if needed
-          8. Invoice if won
-        """
-        log.info(f"Processing job: {job.offer_id}")
-
-        try:
-            # ── Step 1: Resolve make code ──────────────────────
-            job.make_code = self._resolve_make_code(job.make)
-            if not job.make_code:
-                job.status = "error"
-                job.notes  = f"Unknown make: {job.make}"
-                log.error(job.notes)
-                return
-
-            # ── Step 2: Parts inquiry ──────────────────────────
-            log.info(f"[{job.offer_id}] Looking up part in ERA Power...")
-            part_info = lookup_part(self._window, job.make_code, job.part_number)
-
-            if not part_info:
-                job.status = "error"
-                job.notes  = f"Part not found in ERA Power: {job.part_number}"
-                log.error(job.notes)
-                return
-
-            job.description    = part_info["description"]
-            job.our_sell_price = part_info["sale_price"]
-            job.our_list_price = part_info["list_price"]
-            job.avail          = part_info["avail"] or 0
-
-            # ── Step 3: Calculate floor price ─────────────────
-            # TODO: Replace with client's actual margin rules.
-            # Current placeholder: floor = cost price (list_price)
-            # Real rule might be: floor = list_price * 1.05 (5% minimum margin)
-            job.floor_price      = job.our_list_price
-            job.submitted_price  = job.our_sell_price
-
-            log.info(
-                f"[{job.offer_id}] Price: sell=${job.our_sell_price} "
-                f"list=${job.our_list_price} floor=${job.floor_price}"
-            )
-
-            # ── Step 4 & 5: PartsCheck submit + wait ──────────
-            # These calls are STUBS — partscheck.py fills them in.
-            # The orchestrator calls back into this pipeline once
-            # competitor prices are revealed.
-            job.status = "awaiting_reveal"
-            log.info(
-                f"[{job.offer_id}] Ready to submit ${job.submitted_price} "
-                f"to PartsCheck. Handing off to PartsCheck module."
-            )
-
-            # In production: partscheck module submits price, waits,
-            # then calls orchestrator.on_prices_revealed(job, competitor_prices)
-            # For standalone test we simulate the reveal:
-            self._simulate_reveal(job)
-
-        except Exception as e:
-            job.status = "error"
-            job.notes  = str(e)
-            log.error(f"Job {job.offer_id} failed: {e}")
-            raise
-        finally:
-            job.finished_at = datetime.now().isoformat()
-            with self._lock:
-                self._results.append(job.__dict__.copy())
-            log.info(f"Job {job.offer_id} finished — status: {job.status}")
-
-    def on_prices_revealed(self, job: OfferJob, competitor_prices: List[float]):
-        """
-        Called by PartsCheck module once competitor prices are revealed.
-        Runs the price comparison + requote loop.
-
-        Args:
-            job:               the OfferJob being processed
-            competitor_prices: list of floats from PartsCheck reveal
-        """
-        job.competitor_prices = competitor_prices
-        job.lowest_competitor = min(competitor_prices) if competitor_prices else 0.0
-
-        log.info(
-            f"[{job.offer_id}] Prices revealed. "
-            f"Our price: ${job.submitted_price} | "
-            f"Lowest competitor: ${job.lowest_competitor}"
-        )
-
-        self._run_price_decision(job)
-
-    # ── Price Decision Loop ───────────────────────────────────
-
-    def _run_price_decision(self, job: OfferJob):
-        """
-        Core logic:
-          - If we're already the lowest → we won
-          - If we can go lower (above floor) → requote
-          - If we can't go lower → walk away
-        """
-        # Already won
-        if job.submitted_price <= job.lowest_competitor:
-            log.info(f"[{job.offer_id}] ✅ We are the lowest! We WON.")
-            job.status = "won"
-            self._create_winning_invoice(job)
-            return
-
-        # Can we go lower?
-        new_price = self._calculate_requote_price(job)
-
-        if new_price is None:
-            log.info(f"[{job.offer_id}] ❌ Cannot go lower than floor ${job.floor_price}. Walking away.")
-            job.status = "walked"
-            job.notes  = f"Competitor low ${job.lowest_competitor} below our floor ${job.floor_price}"
-            return
-
-        # Check requote attempt cap
-        if job.requote_attempts >= MAX_REQUOTES:
-            log.info(f"[{job.offer_id}] ⚠️  Max requotes ({MAX_REQUOTES}) reached. Walking away.")
-            job.status = "walked"
-            job.notes  = f"Max requotes reached. Competitor low: ${job.lowest_competitor}"
-            return
-
-        # Requote
-        job.requote_attempts += 1
-        log.info(
-            f"[{job.offer_id}] Requoting at ${new_price} "
-            f"(attempt {job.requote_attempts}/{MAX_REQUOTES})..."
-        )
-        job.submitted_price = new_price
-        job.status = "requoting"
-
-        # If quote already exists, modify it; otherwise create fresh
-        if job.quote_number:
-            updated_parts = [{
-                "part_number": job.part_number,
-                "qty":         job.qty,
-                "sale_price":  new_price,
-            }]
-            requote(self._window, job.quote_number, updated_parts)
-        else:
-            # First requote — create the quote now
-            parts = [{ "part_number": job.part_number, "qty": job.qty, "sale_price": new_price }]
-            q = create_quote(self._window, job.make_code, job.customer_search, parts)
-            job.quote_number = q.get("quote_number")
-
-        # Hand back to PartsCheck module to submit new price and wait again
-        # In production: partscheck.py re-submits and calls on_prices_revealed() again
-        # For test: simulate next reveal
-        log.info(f"[{job.offer_id}] New price submitted. Waiting for next reveal...")
-        self._simulate_reveal(job)
-
-    def _calculate_requote_price(self, job: OfferJob) -> Optional[float]:
-        """
-        Determines the new requote price.
-
-        Rules (placeholders — confirm with client):
-          - Target: $0.50 below the lowest competitor
-          - Hard floor: we never go below floor_price
-          - If target < floor → return None (can't compete)
-
-        # TODO: Replace with client's actual rules:
-        #   - Fixed $ margin below competitor?
-        #   - % below competitor?
-        #   - Per-brand rules?
-        #   - Per-category floor?
-        """
-        target = round(job.lowest_competitor - 0.50, 2)
-
-        if target < job.floor_price:
-            return None
-
-        return target
-
-    def _create_winning_invoice(self, job: OfferJob):
-        """
-        Creates the ERA Power quote + invoice once a win is confirmed.
-        Quote is NOT created before this point.
-        """
-        log.info(f"[{job.offer_id}] Creating winning quote + invoice...")
-
-        parts = [{
-            "part_number": job.part_number,
-            "qty":         job.qty,
-            "sale_price":  job.submitted_price,
-        }]
-
-        # Create quote first
-        q = create_quote(
-            self._window,
-            make_code=job.make_code,
-            customer_search=job.customer_search,
-            parts=parts,
-        )
-        job.quote_number = q.get("quote_number")
-        log.info(f"[{job.offer_id}] Quote #{job.quote_number} created.")
-
-        # Convert to invoice
-        inv = convert_to_invoice(
-            self._window,
-            make_code=job.make_code,
-            customer_search=job.customer_search,
-            parts=parts,
-        )
-        job.invoice_number = inv.get("invoice_number")
-        job.status = "invoiced"
-        log.info(f"[{job.offer_id}] Invoice #{job.invoice_number} created. ✅")
-
-    # ── Helpers ───────────────────────────────────────────────
-
-    def _resolve_make_code(self, make: str) -> Optional[str]:
-        """
-        Converts a make name to ERA Power make code.
-        e.g. "toyota" → "TO", "Mercedes-Benz" → "MB"
-        """
-        normalized = make.lower().strip()
-        code = MAKE_CODES.get(normalized)
-        if not code:
-            log.warning(f"Make '{make}' not in MAKE_CODES — trying uppercase match...")
-            # Try partial match
-            for key, val in MAKE_CODES.items():
-                if key in normalized or normalized in key:
-                    code = val
-                    break
-        return code
-
-    def _simulate_reveal(self, job: OfferJob):
-        """
-        STUB — simulates competitor price reveal for standalone testing.
-        In production this is replaced by the PartsCheck module calling
-        on_prices_revealed() after scraping the reveal page.
-
-        # TODO: Remove this method once partscheck.py is integrated.
-        """
-        log.info(f"[{job.offer_id}] [SIMULATED] Competitor prices revealed.")
-
-        # Hardcoded test scenario — change to test different outcomes
-        simulated_competitor_prices = [22.00, 24.50, 25.00]
-
-        self.on_prices_revealed(job, simulated_competitor_prices)
-
-    def _save_results(self):
-        """Saves all job results to JSON log file."""
-        try:
-            with open(RESULTS_FILE, "w") as f:
-                json.dump(self._results, f, indent=2)
-            log.info(f"Results saved to: {RESULTS_FILE}")
-        except Exception as e:
-            log.error(f"Could not save results: {e}")
-
-    def get_results(self):
-        """Returns all completed job results."""
-        with self._lock:
-            return list(self._results)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  STANDALONE TEST
-# ═══════════════════════════════════════════════════════════════
+    def stop(self):
+        self._running = False
+        if self._window:
+            self._window = logoff_era(self._window)
+        log.info("Orchestrator stopped.")
 
 if __name__ == "__main__":
-    """
-    Test with hardcoded jobs.
-    Simulates 2 concurrent PartsCheck offers going through the full pipeline.
-    ERA Power processes them one at a time via the queue.
-
-    Replace hardcoded values with dynamic data from PartsCheck in production.
-    """
-
-    # ── hardcoded test jobs ──────────────────────────────────
-    test_jobs = [
-        OfferJob(
-            offer_id        = "PC-001",
-            make            = "toyota",
-            part_number     = "2321721010",
-            qty             = 1,
-            customer_search = "ABC",
-        ),
-        OfferJob(
-            offer_id        = "PC-002",
-            make            = "holden",
-            part_number     = "92068768",
-            qty             = 2,
-            customer_search = "XYZ",
-        ),
-    ]
-
     orch = Orchestrator()
-
-    try:
-        orch.start()
-
-        # Add all jobs to the queue
-        for job in test_jobs:
-            orch.add_job(job)
-
-        # Process all jobs (blocks until done)
-        orch.run_loop()
-
-    finally:
-        orch.stop()
-
-    # Print summary
-    print("\n══════ RESULTS SUMMARY ══════")
-    for r in orch.get_results():
-        print(
-            f"  {r['offer_id']} | {r['make']} {r['part_number']} | "
-            f"Status: {r['status']} | "
-            f"Price: ${r['submitted_price']} | "
-            f"Quote: {r['quote_number']} | Invoice: {r['invoice_number']}"
-        )
-    print(f"\n💾 Full log: {RESULTS_FILE}")
+    pc_module = PartsCheckModule()
+    
+    for req in pc_module.monitor_new_requests():
+        orch.add_job(req)
+        
+    threading.Thread(target=orch.run).start()
+    time.sleep(15)
+    orch.stop()

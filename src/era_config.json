@@ -1,0 +1,37 @@
+{
+  "era_power": {
+    "exe_path": "C:\\Program Files (x86)\\ERALink Plus\\wInteg.exe",
+    "username": "partscounter",
+    "password": "ap15cu6",
+    "workstation_id": "429"
+  },
+  "margin_rules": {
+    "by_brand": {
+      "TO": 0.15,
+      "GM": 0.12,
+      "MB": 0.20,
+      "default": 0.10
+    },
+    "by_category": {
+      "brakes": 0.20,
+      "filters": 0.10,
+      "engine": 0.25,
+      "default": 0.15
+    }
+  },
+  "requote_rules": {
+    "undercut_fixed_amount": 0.50,
+    "undercut_percentage": null,
+    "min_improvement_threshold": 1.00,
+    "max_requote_attempts": 3
+  },
+  "paths": {
+    "results_log": "C:\\Projects\\pentana\\era_results_log.json",
+    "error_log": "C:\\Projects\\pentana\\era_errors.json",
+    "dead_letter_queue": "C:\\Projects\\pentana\\dead_letter_queue.json"
+  },
+  "alerts": {
+    "slack_webhook": null,
+    "email": null
+  }
+}

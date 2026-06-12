@@ -1,517 +1,40 @@
-# """
-# ERA Power — Quote & Sales Order Module
-# =======================================
-# Screen 2525: Create quotes and convert winning quotes to invoices.
-
-# Key flows:
-#   - create_quote()       → new quote (PQ mode), save/print
-#   - requote()            → modify existing quote with lower price
-#   - convert_to_invoice() → turn a won quote into a sales order / invoice
-
-# Usage (standalone test):
-#     py -3.14 era_quote.py
-
-# Usage (from orchestrator):
-#     from era_quote import create_quote, requote, convert_to_invoice
-# """
-
-# import re
-# import time
-# import json
-# import logging
-# from pywinauto.keyboard import send_keys
-
-# try:
-#     from Era_power import (
-#         find_era_window, launch_era_port, login, logoff_era,
-#         read_screen_text, type_and_enter, navigate_to,
-#         WAIT_SHORT, WAIT_MEDIUM, WAIT_LONG,
-#     )
-# except ImportError:
-#     raise ImportError(
-#         "era_power.py must be in the same directory as era_quote.py"
-#     )
-
-# log = logging.getLogger("eraPower.quote")
-
-# MENU_QUOTE    = "2525"
-# OUTPUT_FILE   = r"C:\Projects\pentana\era_quote_result.json"
-
-
-# # ═══════════════════════════════════════════════════════════════
-# #  CREATE QUOTE  (Screen 2525 → PQ mode)
-# # ═══════════════════════════════════════════════════════════════
-
-# def create_quote(window, make_code, customer_search, parts, counterman=None, order_type=None):
-#     """
-#     Creates a new quote in screen 2525 using the PQ sequence.
-
-#     Args:
-#         window:          ERA Port window
-#         make_code:       e.g. "TO", "GM"
-#         customer_search: customer number or partial name string
-#         parts:           list of dicts:
-#                          [{ "part_number": "2321721010", "qty": 1, "sale_price": 23.75 }]
-#         counterman:      optional counterman number (leave None to keep default)
-#         order_type:      optional order type (leave None to keep "Daily order" default)
-
-#     Returns:
-#         dict: { quote_number, make_code, customer, parts, status }
-
-#     Screen flow per docs:
-#         2525 → make code → PQ + Enter → screen says "quote" → Enter
-#         → customer number or partial name → counterman (if needed)
-#         → order type (if needed) → Enter on ID#
-#         → for each part: part_number → Enter → qty → Enter
-#         → Enter (finish parts)
-#         → E + Enter → E + Enter
-#         → P + Enter (print/email) or S + Enter (save only)
-#     """
-#     log.info(f"Creating quote — make: {make_code}, customer: {customer_search}")
-#     log.info(f"Parts to quote: {len(parts)} line(s)")
-
-#     navigate_to(window, MENU_QUOTE)
-#     time.sleep(WAIT_LONG)
-
-#     # Step 1: Enter make code
-#     log.info(f"Entering make code: {make_code}")
-#     window.set_focus()
-#     send_keys(make_code, pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 2: Enter PQ to switch from invoice to quote mode
-#     log.info("Switching to quote mode (PQ)...")
-#     window.set_focus()
-#     send_keys("PQ", pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Screen now shows "QUOTE" instead of "INVOICE"
-#     # Step 3: Press Enter to pass the invoice# / quote# field
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 4: Enter customer number or partial name
-#     log.info(f"Entering customer: {customer_search}")
-#     window.set_focus()
-#     send_keys(str(customer_search), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 5: Counterman (optional — Enter to keep default)
-#     if counterman:
-#         log.info(f"Setting counterman: {counterman}")
-#         send_keys(str(counterman), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 6: Order type (optional — Enter to keep "Daily order")
-#     if order_type:
-#         log.info(f"Setting order type: {order_type}")
-#         send_keys(str(order_type), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 7: Press Enter on ID# field if prompted
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 8: Enter each part
-#     for part in parts:
-#         _enter_part_line(window, part)
-
-#     # Step 9: Press Enter on empty part# field to signal end of parts
-#     log.info("Finishing part entry...")
-#     window.set_focus()
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 10: E + Enter (first confirmation)
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 11: E + Enter (second confirmation)
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 12: Save the quote (S = save only, P = print/email)
-#     # Using S by default — orchestrator can override to P when needed
-#     log.info("Saving quote (S)...")
-#     send_keys("S")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_LONG)
-
-#     # Read screen to get the assigned quote number
-#     screen = read_screen_text(window)
-
-#     log.debug("=== QUOTE CREATION RAW SCREEN ===")
-#     log.debug(repr(screen[:800]))
-
-#     quote_number = _parse_quote_number(screen)
-
-#     result = {
-#         "quote_number": quote_number,
-#         "make_code":    make_code,
-#         "customer":     customer_search,
-#         "parts":        parts,
-#         "status":       "saved",
-#     }
-
-#     log.info(f"✅ Quote created: #{quote_number}")
-#     return result
-
-
-# # ═══════════════════════════════════════════════════════════════
-# #  REQUOTE — Update price on existing quote
-# # ═══════════════════════════════════════════════════════════════
-
-# def requote(window, quote_number, updated_parts):
-#     """
-#     Modifies an existing quote with new (lower) prices.
-#     Called by the orchestrator when we need to undercut a competitor.
-
-#     Args:
-#         window:        ERA Port window
-#         quote_number:  str — existing quote number to modify
-#         updated_parts: list of dicts:
-#                        [{ "part_number": "2321721010", "qty": 1, "sale_price": 21.00 }]
-
-#     Returns:
-#         True if successful, False otherwise.
-
-#     Screen flow:
-#         2525 → make code → quote number → M (modify)
-#         → navigate to part line → update price
-#         → E + Enter → E + Enter → S/P
-
-#     # TODO: Confirm modify flow from live screen — specifically how to
-#     #       navigate to a specific part line to change its price.
-#     #       ERA Power may use line numbers or part number search.
-#     """
-#     log.info(f"Requoting quote #{quote_number} with {len(updated_parts)} updated part(s)...")
-
-#     navigate_to(window, MENU_QUOTE)
-#     time.sleep(WAIT_LONG)
-
-#     # Enter make code
-#     # TODO: Store make_code in the state object so we can pass it here
-#     # For now the caller must ensure make code is entered via state
-#     window.set_focus()
-#     send_keys("{ENTER}")      # skip make code if already set, or handle via state
-#     time.sleep(WAIT_SHORT)
-
-#     # Enter the existing quote number to load it
-#     log.info(f"Loading quote: {quote_number}")
-#     send_keys(str(quote_number), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_LONG)
-
-#     # Read screen to confirm we loaded the right quote
-#     screen = read_screen_text(window)
-#     if quote_number not in screen:
-#         log.warning(f"Could not confirm quote #{quote_number} loaded.")
-
-#     # Press M to modify
-#     log.info("Entering modify mode (M)...")
-#     send_keys("M")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Update price for each part
-#     for part in updated_parts:
-#         _modify_part_price(window, part)
-
-#     # Finalise
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     send_keys("S")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_LONG)
-
-#     log.info(f"✅ Quote #{quote_number} updated with new prices.")
-#     return True
-
-
-# # ═══════════════════════════════════════════════════════════════
-# #  CONVERT QUOTE TO INVOICE (Sales Order)
-# # ═══════════════════════════════════════════════════════════════
-
-# def convert_to_invoice(window, make_code, customer_search, parts, counterman=None, order_type=None):
-#     """
-#     Creates a sales order / invoice in screen 2525.
-#     Called ONLY after winning the PartsCheck competition.
-
-#     This is the same as create_quote() but WITHOUT the PQ step,
-#     and ends with B (both — complete invoice and email/print).
-
-#     Args:
-#         window:          ERA Port window
-#         make_code:       e.g. "TO"
-#         customer_search: customer number or partial name
-#         parts:           list of dicts with final agreed prices
-#         counterman:      optional
-#         order_type:      optional
-
-#     Returns:
-#         dict: { invoice_number, make_code, customer, parts, status }
-
-#     Screen flow per docs:
-#         2525 → make code → Enter on invoice#
-#         → customer → counterman → order type → Enter on ID#
-#         → parts + qty loop
-#         → E + Enter → E + Enter → B (both = complete + email/print)
-#     """
-#     log.info(f"Creating invoice — make: {make_code}, customer: {customer_search}")
-#     log.info(f"Parts on invoice: {len(parts)} line(s)")
-
-#     navigate_to(window, MENU_QUOTE)
-#     time.sleep(WAIT_LONG)
-
-#     # Step 1: Enter make code
-#     window.set_focus()
-#     send_keys(make_code, pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 2: Press Enter on invoice# (no PQ — this is a real invoice)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 3: Customer
-#     log.info(f"Entering customer: {customer_search}")
-#     send_keys(str(customer_search), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 4: Counterman
-#     if counterman:
-#         send_keys(str(counterman), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 5: Order type
-#     if order_type:
-#         send_keys(str(order_type), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 6: ID# prompt
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_SHORT)
-
-#     # Step 7: Enter each part
-#     for part in parts:
-#         _enter_part_line(window, part)
-
-#     # Step 8: Empty Enter to end part entry
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 9: E + Enter (first)
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 10: E + Enter (second)
-#     send_keys("E")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     # Step 11: B = Both (complete invoice AND email/print)
-#     log.info("Finalising invoice (B = both)...")
-#     send_keys("B")
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_LONG)
-
-#     screen = read_screen_text(window)
-
-#     log.debug("=== INVOICE CREATION RAW SCREEN ===")
-#     log.debug(repr(screen[:800]))
-
-#     invoice_number = _parse_invoice_number(screen)
-
-#     result = {
-#         "invoice_number": invoice_number,
-#         "make_code":      make_code,
-#         "customer":       customer_search,
-#         "parts":          parts,
-#         "status":         "invoiced",
-#     }
-
-#     log.info(f"✅ Invoice created: #{invoice_number}")
-#     return result
-
-
-# # ═══════════════════════════════════════════════════════════════
-# #  INTERNAL HELPERS
-# # ═══════════════════════════════════════════════════════════════
-
-# def _enter_part_line(window, part):
-#     """
-#     Enters a single part line (part number + qty) into 2525.
-
-#     part = { "part_number": "2321721010", "qty": 1, "sale_price": 23.75 }
-
-#     Screen flow:
-#         Input part number → Enter
-#         Input qty → Enter
-#         (repeat for next part)
-
-#     # NOTE: sale_price is NOT entered here — ERA Power pulls it automatically.
-#     #       Price override (if needed for requote) uses _modify_part_price().
-#     #       Confirm with client whether direct price entry is supported on new lines.
-#     """
-#     log.info(f"  Entering part: {part['part_number']} × {part.get('qty', 1)}")
-
-#     window.set_focus()
-#     send_keys(str(part["part_number"]), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-#     send_keys(str(part.get("qty", 1)), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-
-# def _modify_part_price(window, part):
-#     """
-#     Updates the price for a specific part on an existing quote.
-
-#     # TODO: Confirm the exact key sequence for modifying a line price.
-#     #       ERA Power may require:
-#     #         - Typing the line number then navigating to price field, OR
-#     #         - Searching by part number then tabbing to price field
-#     #       Update this function after first live test.
-#     """
-#     log.info(f"  Updating price: {part['part_number']} → ${part['sale_price']}")
-
-#     window.set_focus()
-
-#     # Placeholder sequence — update after confirming live screen behaviour
-#     # Common pattern: type line number → Tab to price field → type new price → Enter
-#     send_keys(str(part.get("line_number", "")), pause=0.05)
-#     send_keys("{TAB}")
-#     time.sleep(WAIT_SHORT)
-
-#     send_keys(str(part["sale_price"]), pause=0.05)
-#     send_keys("{ENTER}")
-#     time.sleep(WAIT_MEDIUM)
-
-
-# def _parse_quote_number(screen_text):
-#     """
-#     Extracts assigned quote number from the screen after saving.
-
-#     # TODO: Confirm exact label used in ERA Power for quote number.
-#     #       May be "Quote#", "Q#", "Ref#" etc.
-#     """
-#     patterns = [
-#         r"Quote#?\s*[:\s]*(\d+)",
-#         r"Q#?\s*[:\s]*(\d+)",
-#         r"Ref#?\s*[:\s]*(\d+)",
-#     ]
-#     for pattern in patterns:
-#         m = re.search(pattern, screen_text, re.IGNORECASE)
-#         if m:
-#             return m.group(1)
-#     log.warning("Could not parse quote number from screen.")
-#     return None
-
-
-# def _parse_invoice_number(screen_text):
-#     """
-#     Extracts invoice number from the screen after completing.
-
-#     # TODO: Confirm exact label used in ERA Power for invoice number.
-#     """
-#     patterns = [
-#         r"Invoice#?\s*[:\s]*(\d+)",
-#         r"Inv#?\s*[:\s]*(\d+)",
-#         r"#\s*(\d{5,})",
-#     ]
-#     for pattern in patterns:
-#         m = re.search(pattern, screen_text, re.IGNORECASE)
-#         if m:
-#             return m.group(1)
-#     log.warning("Could not parse invoice number from screen.")
-#     return None
-
-
-# # ═══════════════════════════════════════════════════════════════
-# #  STANDALONE TEST
-# # ═══════════════════════════════════════════════════════════════
-
-# if __name__ == "__main__":
-#     logging.basicConfig(
-#         level=logging.INFO,
-#         format="%(asctime)s [%(levelname)s] %(message)s"
-#     )
-
-#     # ── hardcoded test values — replace with dynamic data in production ──
-#     TEST_MAKE     = "TO"
-#     TEST_CUSTOMER = "ABC"
-#     TEST_PARTS    = [
-#         { "part_number": "2321721010", "qty": 1, "sale_price": 23.75 },
-#     ]
-
-#     try:
-#         era_window = launch_era_port()
-#         login(era_window)
-
-#         # Test: create a quote
-#         result = create_quote(
-#             era_window,
-#             make_code=TEST_MAKE,
-#             customer_search=TEST_CUSTOMER,
-#             parts=TEST_PARTS,
-#         )
-
-#         print("\n✅ Quote created!")
-#         print(f"   Quote#:   {result['quote_number']}")
-#         print(f"   Customer: {result['customer']}")
-#         print(f"   Parts:    {len(result['parts'])}")
-#         print(f"   Status:   {result['status']}")
-
-#         with open(OUTPUT_FILE, "w") as f:
-#             json.dump(result, f, indent=2)
-#         print(f"\n💾 Saved to: {OUTPUT_FILE}")
-
-#         era_window = logoff_era(era_window)
-
-#     except Exception as e:
-#         log.error(f"Error: {e}")
-#         raise
 """
-ERA Power — Quote & Sales Order Module (FIXED)
-================================================
-Screen 2525: Create quotes and convert winning quotes to invoices.
+ERA Power — Quote & Sales Order Module
+=======================================
+Screen 2525
 
-Key flows:
-  - create_quote()       → new quote (PQ mode), save/print
-  - requote()            → modify existing quote with lower price
-  - convert_to_invoice() → turn a won quote into a sales order / invoice
+Two flows — only difference is PQ at the start for quotes:
 
-Changes from original:
-  - Removed extra Enter after PQ (was skipping past customer field)
-  - Fixed regex parsers to handle alphanumeric IDs like "1104172D"
-  - Added screen validation after each major step
-  - requote() now uses R=Reprice command from ERA's command bar
-  - Added _validate_screen() helper for robust step-by-step checks
-  - create_quote saves with S by default; print_quote flag added for P
+  SALES ORDER flow:
+    2525 + Enter
+    make code + Enter
+    Enter  (skip invoice#)
+    customer id + Enter
+    Enter  (skip field after customer)
+    Enter  (skip order type)
+    part# + Enter  → qty + Enter  (repeat for all parts)
+    Enter  (done with parts)
+    E + Enter
+    E + Enter
+    → read screen → save to JSON
+    S + Enter  (save)
+    NOTE: counterman is NOT set in sales flow — field is pre-filled/skipped
 
-Usage (standalone test):
-    py -3.14 era_quote_fixed.py
-
-Usage (from orchestrator):
-    from era_quote_fixed import create_quote, requote, convert_to_invoice
+  QUOTE flow:
+    2525 + Enter
+    make code + Enter
+    PQ + Enter  ← only difference
+    Enter  (skip quote#)
+    customer id + Enter
+    Enter  (skip field)
+    counterman if provided else Enter
+    Enter  (skip order type)
+    part# + Enter  → qty + Enter  (repeat for all parts)
+    Enter  (done with parts)
+    E + Enter
+    E + Enter
+    → read screen → save to JSON
+    S + Enter  (save)
 """
 
 import re
@@ -520,570 +43,295 @@ import json
 import logging
 from pywinauto.keyboard import send_keys
 
-try:
-    from Era_power import (
-        find_era_window, launch_era_port, login, logoff_era,
-        read_screen_text, type_and_enter, navigate_to,
-        wait_for_text,
-        WAIT_SHORT, WAIT_MEDIUM, WAIT_LONG,
-    )
-except ImportError:
-    raise ImportError(
-        "Era_power.py must be in the same directory as era_quote_fixed.py"
-    )
+from Era_power import (
+    find_era_window,
+    launch_era_port,
+    login,
+    logoff_era,
+    read_screen_text,
+    navigate_to,
+    wait_for_text,
+    WAIT_SHORT,
+    WAIT_MEDIUM,
+    WAIT_LONG,
+)
 
 log = logging.getLogger("eraPower.quote")
 
-MENU_QUOTE    = "2525"
-OUTPUT_FILE   = r"C:\Projects\pentana\era_quote_result.json"
+OUTPUT_FILE = r"C:\Projects\pentana\era_quote_result.json"
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SCREEN VALIDATION HELPER
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
+#  SALES ORDER
+# ─────────────────────────────────────────────────────────────
 
-def _validate_screen(window, expected_text, step_name, timeout=10):
+def create_sales_order(window, make_code, customer_id, parts, counterman=None):
     """
-    Reads screen and checks for expected text. Logs warning if not found.
-    Returns the screen text regardless.
-
-    This prevents blind keystroke sequences from going off-rail when
-    the system is slow or an unexpected popup appears.
-    """
-    found = wait_for_text(window, expected_text, timeout=timeout)
-    screen = read_screen_text(window)
-    if not found:
-        log.warning(
-            f"[{step_name}] Expected '{expected_text}' on screen but didn't find it. "
-            f"Screen preview: {repr(screen[:200])}"
-        )
-    else:
-        log.info(f"[{step_name}] Screen confirmed — found '{expected_text}'")
-    return screen
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CREATE QUOTE  (Screen 2525 → PQ mode)
-# ═══════════════════════════════════════════════════════════════
-
-def create_quote(window, make_code, customer_search, parts,
-                 counterman=None, order_type=None, print_quote=False):
-    """
-    Creates a new quote in screen 2525 using the PQ sequence.
+    Creates a sales order in screen 2525.
 
     Args:
-        window:          ERA Port window
-        make_code:       e.g. "TO", "GM"
-        customer_search: customer number or partial name string
-        parts:           list of dicts:
-                         [{ "part_number": "2321721010", "qty": 1 }]
-        counterman:      optional counterman number (leave None to keep default)
-        order_type:      optional order type (leave None to keep "Daily order" default)
-        print_quote:     if True, sends P (print/email + save); if False, sends S (save only)
+        window:      ERA Port window
+        make_code:   e.g. "TO"
+        customer_id: customer number string e.g. "158746"
+        parts:       list of dicts [{ "part_number": "2321721010", "qty": 1 }]
+        counterman:  optional e.g. "JOEL" — asked after two Enters post-customer
+                     if None just presses Enter to keep default
 
     Returns:
-        dict: { quote_number, make_code, customer, parts, totals, status }
+        dict saved to OUTPUT_FILE JSON
 
-    Doc flow (exact):
-        2525 → make code + Enter
-        → PQ + Enter (screen changes from "Invoice" to "Quote")
-        → Enter (pass Quote# field — system assigns number on save)
-        → customer number or partial name + Enter
-        → counterman + Enter (or just Enter to keep default)
-        → order type + Enter (or just Enter to keep "Daily order")
-        → Enter on ID# if prompted
-        → for each part: part_number + Enter → qty + Enter
-        → Enter on empty line (finish parts)
-        → E + Enter
-        → E + Enter
-        → P + Enter (print/email) or S + Enter (save only)
-
-    IMPORTANT: The doc's "Press enter" after "Screen will then change word
-    invoice to quote" is the Enter on the Quote# field — NOT a separate
-    confirmation step. PQ goes into Invoice# field, Enter submits it,
-    screen switches to Quote mode, cursor lands on Quote# field, then
-    you press Enter to pass it.
+    Exact sequence:
+        2525 → make code → Enter (invoice#) → customer
+        → Enter → Enter → counterman → Enter (order type) → parts
     """
-    log.info(f"Creating quote — make: {make_code}, customer: {customer_search}")
-    log.info(f"Parts to quote: {len(parts)} line(s)")
+    log.info(f"=== SALES ORDER | make={make_code} customer={customer_id} parts={len(parts)} ===")
 
-    # Navigate to screen 2525
-    navigate_to(window, MENU_QUOTE)
+    # Navigate to 2525
+    navigate_to(window, "2525")
     time.sleep(WAIT_LONG)
 
-    # Step 1: Enter make code
-    log.info(f"Entering make code: {make_code}")
-    window.set_focus()
-    send_keys(make_code, pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
+    # Make code
+    _send(window, make_code)
 
-    # Step 2: Type PQ into the Invoice# field to switch to Quote mode
-    # Screenshot img_10 confirms: "pq" is typed into the Invoice# field
-    # on the "Counter Sales" screen. After Enter, the header changes to "QUOTES".
-    log.info("Switching to quote mode (PQ)...")
-    window.set_focus()
-    send_keys("PQ", pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
+    # Enter on Invoice# (blank — not a quote)
+    _enter(window)
 
-    # Validate: screen should now say "QUOTES" instead of "Counter Sales"
-    _validate_screen(window, "QUOTES", "PQ switch")
+    # Customer ID
+    _send(window, customer_id)
 
-    # Step 3: Press Enter on the Quote# field
-    # Screenshot img_8 confirms: after PQ, the field label changes to "Quote#"
-    # and cursor is sitting there. We press Enter to pass it (number assigned on save).
-    # Screenshot img_4 confirms: cursor then moves to "Cust #" field.
-    log.info("Pressing Enter on Quote# field...")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
+    # Enter (first skip after customer)
+    _enter(window)
 
-    # Step 4: Enter customer number or partial name
-    log.info(f"Entering customer: {customer_search}")
-    window.set_focus()
-    send_keys(str(customer_search), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
+    # Enter (second skip)
+    _enter(window)
 
-    # Step 5: Counterman (optional — Enter to keep default)
+    # Counterman — asked here after the two enters
     if counterman:
         log.info(f"Setting counterman: {counterman}")
-        send_keys(str(counterman), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 6: Order type (optional — Enter to keep "Daily order")
-    if order_type:
-        log.info(f"Setting order type: {order_type}")
-        send_keys(str(order_type), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 7: Press Enter on ID# field if prompted
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 8: Enter each part
-    for part in parts:
-        _enter_part_line(window, part)
-
-    # Step 9: Press Enter on empty part# field to signal end of parts
-    log.info("Finishing part entry (Enter on empty line)...")
-    window.set_focus()
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 10: E + Enter (first confirmation — exits part entry)
-    log.info("First E + Enter...")
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 11: E + Enter (second confirmation — moves to summary screen)
-    log.info("Second E + Enter...")
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Validate: summary screen should now be visible
-    # Screenshot img_11 shows: Quote# at top, totals, and options at bottom
-    screen = _validate_screen(window, "Total", "Quote summary")
-
-    # Capture totals from summary screen before saving
-    totals = _parse_summary_totals(screen)
-
-    # Step 12: Save or Print
-    if print_quote:
-        log.info("Printing and saving quote (P)...")
-        send_keys("P")
+        _send(window, counterman)
     else:
-        log.info("Saving quote (S)...")
-        send_keys("S")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_LONG)
+        _enter(window)
 
-    # Read screen to get the assigned quote number
+    # Order type — always just Enter (not changing in prod)
+    _enter(window)
+
+    # Enter all parts
+    for part in parts:
+        _enter_part(window, part)
+
+    # Empty Enter — signals end of parts
+    _enter(window)
+
+    # E + Enter (first)
+    _send(window, "E")
+
+    # E + Enter (second)
+    _send(window, "E")
+
+    # Read summary screen and save to JSON before pressing S
+    time.sleep(WAIT_LONG)
     screen = read_screen_text(window)
+    result = _parse_summary(screen, mode="sales", make_code=make_code,
+                            customer_id=customer_id, parts=parts)
+    _save_json(result)
 
-    log.debug("=== QUOTE CREATION RAW SCREEN ===")
-    log.debug(repr(screen[:800]))
-
-    quote_number = _parse_quote_number(screen)
-
-    result = {
-        "quote_number": quote_number,
-        "make_code":    make_code,
-        "customer":     customer_search,
-        "parts":        parts,
-        "totals":       totals,
-        "status":       "saved" if not print_quote else "printed",
-    }
-
-    log.info(f"✅ Quote created: #{quote_number}")
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════
-#  REQUOTE — Update price on existing quote
-# ═══════════════════════════════════════════════════════════════
-
-def requote(window, make_code, quote_number, updated_parts):
-    """
-    Modifies an existing quote with new (lower) prices.
-    Called by the orchestrator when we need to undercut a competitor.
-
-    Args:
-        window:        ERA Port window
-        make_code:     str — make code (required to enter 2525 properly)
-        quote_number:  str — existing quote number to modify (e.g. "1104172D")
-        updated_parts: list of dicts:
-                       [{ "line_number": 1, "part_number": "2321721010", "sale_price": 21.00 }]
-
-    Returns:
-        True if successful, False otherwise.
-
-    The command bar on the quote screen (screenshot img_2) shows:
-        (A=Add)(D=Del)(E=Ent)(M=Mod)(Pn=Pg#)(O=Opt)(R=Reprice)(Q=Inq)(CI=CustInq)
-
-    R=Reprice is the correct command for changing a price on an existing line.
-
-    Flow:
-        2525 → make code → quote number + Enter (loads existing quote)
-        → for each part: navigate to line → R (Reprice) → new price + Enter
-        → E + Enter → E + Enter → S (save)
-    """
-    log.info(f"Requoting quote #{quote_number} with {len(updated_parts)} updated part(s)...")
-
-    navigate_to(window, MENU_QUOTE)
-    time.sleep(WAIT_LONG)
-
-    # Enter make code (required every time you enter 2525)
-    log.info(f"Entering make code: {make_code}")
+    # S to save
+    log.info("Saving sales order (S)...")
     window.set_focus()
-    send_keys(make_code, pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Enter the existing quote number to load it
-    # For quotes, type the quote number where Invoice#/Quote# field is
-    log.info(f"Loading quote: {quote_number}")
-    send_keys(str(quote_number), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_LONG)
-
-    # Validate: confirm we loaded the right quote
-    screen = _validate_screen(window, quote_number, "Load quote")
-
-    # Update price for each part using R=Reprice
-    for part in updated_parts:
-        _reprice_part_line(window, part)
-
-    # Finalise: E + Enter twice, then Save
-    log.info("Finalising requote...")
-    send_keys("{ENTER}")  # exit part entry area
-    time.sleep(WAIT_MEDIUM)
-
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
     send_keys("S")
     send_keys("{ENTER}")
     time.sleep(WAIT_LONG)
 
-    log.info(f"✅ Quote #{quote_number} updated with new prices.")
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CONVERT QUOTE TO INVOICE (Sales Order)
-# ═══════════════════════════════════════════════════════════════
-
-def convert_to_invoice(window, make_code, customer_search, parts,
-                       counterman=None, order_type=None):
-    """
-    Creates a sales order / invoice in screen 2525.
-    Called ONLY after winning the PartsCheck competition.
-
-    This is the same as create_quote() but WITHOUT the PQ step,
-    and ends with B (both — complete invoice and email/print).
-
-    Args:
-        window:          ERA Port window
-        make_code:       e.g. "TO"
-        customer_search: customer number or partial name
-        parts:           list of dicts with final agreed prices
-        counterman:      optional
-        order_type:      optional
-
-    Returns:
-        dict: { invoice_number, make_code, customer, parts, totals, status }
-
-    Doc flow (exact):
-        2525 → make code + Enter
-        → Enter on invoice# (leave blank — no PQ)
-        → customer number or partial name + Enter
-        → counterman + Enter
-        → order type + Enter
-        → Enter on ID#
-        → parts + qty loop
-        → Enter on empty line
-        → E + Enter → E + Enter
-        → B (both = complete invoice + email/print)
-    """
-    log.info(f"Creating invoice — make: {make_code}, customer: {customer_search}")
-    log.info(f"Parts on invoice: {len(parts)} line(s)")
-
-    navigate_to(window, MENU_QUOTE)
-    time.sleep(WAIT_LONG)
-
-    # Step 1: Enter make code
-    window.set_focus()
-    send_keys(make_code, pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Validate: should be on Counter Sales screen
-    _validate_screen(window, "Counter Sales", "Invoice entry")
-
-    # Step 2: Press Enter on invoice# (no PQ — this is a real invoice)
-    # Doc: "Press enter on invoice# then input customer number"
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 3: Customer
-    log.info(f"Entering customer: {customer_search}")
-    send_keys(str(customer_search), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 4: Counterman
-    if counterman:
-        send_keys(str(counterman), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 5: Order type
-    if order_type:
-        send_keys(str(order_type), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 6: ID# prompt
-    send_keys("{ENTER}")
-    time.sleep(WAIT_SHORT)
-
-    # Step 7: Enter each part
-    for part in parts:
-        _enter_part_line(window, part)
-
-    # Step 8: Empty Enter to end part entry
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 9: E + Enter (first)
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Step 10: E + Enter (second)
-    send_keys("E")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    # Validate: summary screen with totals and B option
-    screen = _validate_screen(window, "Total", "Invoice summary")
-    totals = _parse_summary_totals(screen)
-
-    # Step 11: B = Both (complete invoice AND email/print)
-    log.info("Finalising invoice (B = both)...")
-    send_keys("B")
-    send_keys("{ENTER}")
-    time.sleep(WAIT_LONG)
-
-    screen = read_screen_text(window)
-
-    log.debug("=== INVOICE CREATION RAW SCREEN ===")
-    log.debug(repr(screen[:800]))
-
-    invoice_number = _parse_invoice_number(screen)
-
-    result = {
-        "invoice_number": invoice_number,
-        "make_code":      make_code,
-        "customer":       customer_search,
-        "parts":          parts,
-        "totals":         totals,
-        "status":         "invoiced",
-    }
-
-    log.info(f"✅ Invoice created: #{invoice_number}")
+    log.info(f"✅ Sales order done. Invoice#: {result.get('invoice_number')}")
     return result
 
 
-# ═══════════════════════════════════════════════════════════════
-#  INTERNAL HELPERS
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
+#  QUOTE
+# ─────────────────────────────────────────────────────────────
 
-def _enter_part_line(window, part):
+def create_quote(window, make_code, customer_id, parts, counterman=None):
     """
-    Enters a single part line (part number + qty) into 2525.
-
-    part = { "part_number": "2321721010", "qty": 1 }
-
-    Doc flow:
-        Input part number → Enter
-        Input required qty → Enter
-        (repeat for next part)
-
-    NOTE: sale_price is NOT entered during initial part entry.
-    ERA Power auto-calculates the price based on customer pricing tier.
-    To override a price on an existing quote, use _reprice_part_line().
-    """
-    pn  = part["part_number"]
-    qty = part.get("qty", 1)
-
-    log.info(f"  Entering part: {pn} × {qty}")
-
-    window.set_focus()
-    send_keys(str(pn), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-    send_keys(str(qty), pause=0.05)
-    send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
-
-
-def _reprice_part_line(window, part):
-    """
-    Updates the price for a specific part on an existing quote using R=Reprice.
-
-    The command bar (visible in screenshot img_2) shows:
-        (A=Add)(D=Del)(E=Ent)(M=Mod)(Pn=Pg#)(O=Opt)(R=Reprice)(Q=Inq)(CI=CustInq)
-
-    R=Reprice is the dedicated command for changing a line's sale price.
+    Creates a quote in screen 2525.
+    Identical to sales order except PQ is typed after the make code.
 
     Args:
-        part: dict with keys:
-            - line_number (int): the line number on the quote (1, 2, 3...)
-            - sale_price (float): the new price to set
+        window:      ERA Port window
+        make_code:   e.g. "TO"
+        customer_id: customer number string e.g. "158746"
+        parts:       list of dicts [{ "part_number": "2321721010", "qty": 1 }]
+        counterman:  optional e.g. "JOEL" — if None just presses Enter
 
-    Flow (best guess — needs live testing):
-        Type line number + Enter → R (Reprice) → new price + Enter
-
-    TODO: Confirm exact reprice flow on live system.
-          - Does R prompt for line number, or must you navigate to the line first?
-          - Does it accept a decimal price directly?
-          - After entering price, does it return to the part list or need Enter?
+    Returns:
+        dict saved to OUTPUT_FILE JSON
     """
-    line_num = part.get("line_number")
-    new_price = part["sale_price"]
+    log.info(f"=== QUOTE | make={make_code} customer={customer_id} parts={len(parts)} ===")
 
-    log.info(f"  Repricing line {line_num}: → ${new_price}")
+    # Navigate to 2525
+    navigate_to(window, "2525")
+    time.sleep(WAIT_LONG)
 
+    # Make code
+    _send(window, make_code)
+
+    # PQ — this is the only difference from sales order
+    # Switches screen from "Counter Sales" to "QUOTES"
+    _send(window, "PQ")
+
+    # Enter on Quote# (system assigns number on save)
+    _enter(window)
+
+    # Customer ID
+    _send(window, customer_id)
+
+    # Enter (skip field after customer)
+    _enter(window)
+
+    # Counterman — type if provided, otherwise just Enter
+    if counterman:
+        log.info(f"Setting counterman: {counterman}")
+        _send(window, counterman)
+    else:
+        _enter(window)
+
+    # Order type — always just Enter
+    _enter(window)
+
+    # Enter all parts
+    for part in parts:
+        _enter_part(window, part)
+
+    # Empty Enter — signals end of parts
+    _enter(window)
+
+    # E + Enter (first)
+    _send(window, "E")
+
+    # E + Enter (second)
+    _send(window, "E")
+
+    # Read summary screen and save to JSON before pressing S
+    time.sleep(WAIT_LONG)
+    screen = read_screen_text(window)
+    result = _parse_summary(screen, mode="quote", make_code=make_code,
+                            customer_id=customer_id, parts=parts)
+    _save_json(result)
+
+    # S to save
+    log.info("Saving quote (S)...")
     window.set_focus()
-
-    # Navigate to the line (type line number to select it)
-    if line_num:
-        send_keys(str(line_num), pause=0.05)
-        send_keys("{ENTER}")
-        time.sleep(WAIT_SHORT)
-
-    # Press R for Reprice
-    send_keys("R")
-    time.sleep(WAIT_SHORT)
-
-    # Enter new price
-    send_keys(str(new_price), pause=0.05)
+    send_keys("S")
     send_keys("{ENTER}")
-    time.sleep(WAIT_MEDIUM)
+    time.sleep(WAIT_LONG)
+
+    log.info(f"✅ Quote done. Quote#: {result.get('quote_number')}")
+    return result
 
 
-def _parse_quote_number(screen_text):
+# ─────────────────────────────────────────────────────────────
+#  INTERNAL HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _send(window, text, wait=WAIT_MEDIUM):
+    """Types text and presses Enter."""
+    window.set_focus()
+    send_keys(str(text), pause=0.05)
+    send_keys("{ENTER}")
+    time.sleep(wait)
+
+
+def _enter(window, wait=WAIT_SHORT):
+    """Just presses Enter — used to skip optional fields."""
+    window.set_focus()
+    send_keys("{ENTER}")
+    time.sleep(wait)
+
+
+def _enter_part(window, part):
     """
-    Extracts assigned quote number from the screen after saving.
+    Enters one part line: part number + Enter, qty + Enter.
 
-    ERA Power uses alphanumeric quote numbers like "1104172D"
-    (screenshot img_11 shows Quote# 1104172D).
-    The old regex only matched pure digits — FIXED to match alphanumeric.
+    part = { "part_number": "2321721010", "qty": 1 }
     """
-    patterns = [
-        r"Quote#?\s*[:\s]*([A-Z0-9]+)",
-        r"Q#?\s*[:\s]*([A-Z0-9]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, screen_text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            # Filter out noise — quote numbers are typically 6+ chars
-            if len(val) >= 4:
-                return val
-    log.warning("Could not parse quote number from screen.")
-    return None
+    pn  = str(part["part_number"])
+    qty = str(part.get("qty", 1))
+    log.info(f"  Part: {pn}  Qty: {qty}")
+    _send(window, pn)
+    _send(window, qty)
 
 
-def _parse_invoice_number(screen_text):
+def _parse_summary(screen_text, mode, make_code, customer_id, parts):
     """
-    Extracts invoice number from the screen after completing.
+    Parses the summary screen (shown after E+E) to build the result dict.
 
-    ERA Power uses alphanumeric invoice numbers like "1980376D"
-    (screenshot img_13 shows Invoice# 1980376D).
-    FIXED to match alphanumeric.
+    Summary screen fields captured (from screenshots img_3, img_11, img_13):
+      Invoice# / Quote#, Customer#, Sale Type, Pay-Method,
+      Order Date, Required Date, Ship To,
+      Total (No Tax), GST, Misc, Freight, Total Invoice/Quote,
+      Total Line Items, Order Type
     """
-    patterns = [
-        r"Invoice#?\s*[:\s]*([A-Z0-9]+)",
-        r"Inv#?\s*[:\s]*([A-Z0-9]+)",
-        r"Control\s+No\.?\s*[:\s]*([A-Z0-9]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, screen_text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            if len(val) >= 4:
-                return val
-    log.warning("Could not parse invoice number from screen.")
-    return None
-
-
-def _parse_summary_totals(screen_text):
-    """
-    Extracts key totals from the summary screen (quote or invoice).
-
-    Screenshots img_3, img_11, img_13 show fields like:
-        Total (No Tax)   165.49
-        GST              16.55
-        Total Quote      182.04   or   Total Invoice   169.00
-        ~GP$             17.73
-        ~GP%             10.7
-    """
-    totals = {}
-
-    patterns = {
-        "total_no_tax":   r"Total\s*\(No\s*Tax\)\s+([\d.]+)",
-        "gst":            r"GST\s+([\d.]+)",
-        "total_quote":    r"Total\s+Quote\s+([\d.]+)",
-        "total_invoice":  r"Total\s+Invoice\s+([\d.]+)",
-        "gp_dollars":     r"[~^]GP\$\s+([\d.]+)",
-        "gp_percent":     r"[~^]GP%\s+([\d.]+)",
-        "balance":        r"Bal\s+([\d.]+)",
+    result = {
+        "mode":          mode,          # "sales" or "quote"
+        "make_code":     make_code,
+        "customer_id":   customer_id,
+        "parts":         parts,
     }
 
-    for key, pattern in patterns.items():
+    # Invoice# or Quote# — alphanumeric e.g. "1980376D", "1104172D"
+    inv_m = re.search(r"Invoice#?\s+([A-Z0-9]+)", screen_text, re.IGNORECASE)
+    qt_m  = re.search(r"Quote#?\s+([A-Z0-9]+)",   screen_text, re.IGNORECASE)
+
+    if mode == "sales" and inv_m:
+        result["invoice_number"] = inv_m.group(1).strip()
+    elif mode == "quote" and qt_m:
+        result["quote_number"] = qt_m.group(1).strip()
+
+    # Control No (sales order only)
+    ctrl = re.search(r"Control\s+No\.?\s+([A-Z0-9]+)", screen_text, re.IGNORECASE)
+    if ctrl:
+        result["control_number"] = ctrl.group(1).strip()
+
+    # Financials
+    fin_patterns = {
+        "total_no_tax":    r"Total\s*\(No\s*Tax\)\s+([\d.]+)",
+        "gst":             r"GST\s+([\d.]+)",
+        "misc":            r"Misc\s+([-\d.]+)",
+        "freight":         r"Freight\s+([\d.]+)",
+        "total_invoice":   r"Total\s+Invoice\s+([\d.]+)",
+        "total_quote":     r"Total\s+Quote\s+([\d.]+)",
+        "total_line_items":r"Total\s+Line\s+It[a-z]+\s+([\d.]+)",
+        "order_type":      r"Order\s+Type\s+([A-Z]+)",
+        "pay_method":      r"Pay-Method\s+([A-Z]+)",
+        "sale_type":       r"Sale\s+Type\s+([A-Z]+)",
+        "order_date":      r"Order\s+Date\s+([\d/]+)",
+    }
+
+    for key, pattern in fin_patterns.items():
         m = re.search(pattern, screen_text, re.IGNORECASE)
         if m:
-            totals[key] = float(m.group(1))
+            val = m.group(1).strip()
+            # Convert numeric strings to float
+            try:
+                result[key] = float(val)
+            except ValueError:
+                result[key] = val
 
-    return totals
+    return result
 
 
-# ═══════════════════════════════════════════════════════════════
+def _save_json(data):
+    """Saves result dict to OUTPUT_FILE."""
+    try:
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        log.info(f"💾 Saved to: {OUTPUT_FILE}")
+    except Exception as e:
+        log.error(f"Could not save JSON: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 #  STANDALONE TEST
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -1091,38 +339,40 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    # ── hardcoded test values — replace with dynamic data in production ──
-    TEST_MAKE     = "TO"
-    TEST_CUSTOMER = "158746"
-    TEST_PARTS    = [
-        { "part_number": "2321721010", "qty": 1 },
-        { "part_number": "2330030410", "qty": 2 },
+    TEST_MAKE      = "TO"
+    TEST_CUSTOMER  = "158746"
+    TEST_COUNTERMAN = "JOEL"
+    TEST_PARTS = [
+        {"part_number": "2321721010", "qty": 1},
+        {"part_number": "2330030410", "qty": 2},
     ]
 
     try:
-        era_window = launch_era_port()
-        login(era_window)
+        window = launch_era_port()
+        login(window)
 
-        # Test: create a quote
-        result = create_quote(
-            era_window,
+        # ── Test sales order ──
+        result = create_sales_order(
+            window,
             make_code=TEST_MAKE,
-            customer_search=TEST_CUSTOMER,
+            customer_id=TEST_CUSTOMER,
             parts=TEST_PARTS,
         )
+        print("\n✅ Sales order result:")
+        print(json.dumps(result, indent=2))
 
-        print("\n✅ Quote created!")
-        print(f"   Quote#:   {result['quote_number']}")
-        print(f"   Customer: {result['customer']}")
-        print(f"   Parts:    {len(result['parts'])}")
-        print(f"   Totals:   {result['totals']}")
-        print(f"   Status:   {result['status']}")
+        # ── Test quote ──
+        # result = create_quote(
+        #     window,
+        #     make_code=TEST_MAKE,
+        #     customer_id=TEST_CUSTOMER,
+        #     parts=TEST_PARTS,
+        #     counterman=TEST_COUNTERMAN,
+        # )
+        # print("\n✅ Quote result:")
+        # print(json.dumps(result, indent=2))
 
-        with open(OUTPUT_FILE, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"\n💾 Saved to: {OUTPUT_FILE}")
-
-        era_window = logoff_era(era_window)
+        window = logoff_era(window)
 
     except Exception as e:
         log.error(f"Error: {e}")
